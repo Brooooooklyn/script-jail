@@ -5305,6 +5305,9 @@ describe('LinuxStraceRunner stderr forwarding', () => {
       env: {},
       cwd: tailerDir,
       basePath,
+      // child.pid=0 makes readStraceChildPid throw on every /proc read; a tiny
+      // deadline returns null promptly instead of waiting the production default.
+      rootPidResolveDeadlineMs: 15,
     });
     const itemsPromise: Promise<Array<{ pid: number; line: string; source: 'shim' | 'strace' }>> = (async () => {
       const collected: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [];
@@ -5326,6 +5329,60 @@ describe('LinuxStraceRunner stderr forwarding', () => {
     // file with pid 4242 was visible the entire run.  The suppression
     // is what bug #3's fix introduces.
     expect(runner.getRootPid()).toBeNull();
+  });
+
+  // Adversarial-review [high] (2026-06-22): strace's `close`/`error` handlers
+  // MUST be attached IMMEDIATELY after spawn — BEFORE the readStraceChildPid
+  // PID-stabilization await (which can poll /proc for up to ~5s).  `close` is
+  // one-shot and un-buffered: if strace dies DURING that await with no listener
+  // attached, the event is lost, exitPromise never resolves, the tailer's `done`
+  // flag is never set, and the audit HANGS forever (denial of audit).  Here the
+  // fake child fires `close` ~30ms into a 300ms PID-resolution window; with the
+  // handler attached pre-await the run completes promptly, with the (pre-fix)
+  // post-await attachment it would hang past the race deadline.
+  it('strace close DURING PID-stabilization await is captured (no hang) (review [high])', async () => {
+    const fakeStderr = new PassThrough();
+    const fakeFd3 = new PassThrough();
+    let closeListener: ((code: number | null) => void) | undefined;
+
+    // pid=0 → readStraceChildPid throws on every /proc read and loops to the
+    // deadline, giving a real await window during which we fire `close`.
+    const fakeChild: SpawnResult = {
+      stderr: fakeStderr,
+      stdio: [null, null, fakeStderr, fakeFd3],
+      pid: 0,
+      on(event: string, listener: unknown) {
+        if (event === 'close') closeListener = listener as (code: number | null) => void;
+        return this;
+      },
+    };
+
+    const runner = new LinuxStraceRunner(() => fakeChild);
+    const basePath = `${tailerDir}/strace.out`;
+
+    const runIter = runner.run('npm', ['rebuild'], {
+      env: {},
+      cwd: tailerDir,
+      basePath,
+      // 300ms window so the close (fired at ~30ms) lands DURING the await.
+      rootPidResolveDeadlineMs: 300,
+    });
+    const itemsPromise = (async () => {
+      for await (const _item of runIter) {
+        void _item;
+      }
+    })();
+    fakeStderr.push(null);
+    fakeFd3.push(null);
+    // Fire close 30ms in — well inside the 300ms stabilization await. With the
+    // pre-await handler attachment, closeListener is already set.
+    setTimeout(() => { closeListener?.(0); }, 30);
+
+    const outcome = await Promise.race([
+      itemsPromise.then(() => 'completed' as const),
+      new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 4000)),
+    ]);
+    expect(outcome).toBe('completed');
   });
 
   // Bug #3 sanity — the test-fake fallback path still works.  When
@@ -5447,7 +5504,7 @@ describe('readStraceChildPid', () => {
     // every readFileSync attempt will throw and the loop will exit
     // after the deadline.  Set a short deadline to keep the test fast.
     const { readStraceChildPid } = await import('../../src/guest/agent.js');
-    const result = readStraceChildPid(0, 15);
+    const result = await readStraceChildPid(0, 15);
     expect(result).toBeNull();
   });
 
@@ -5457,8 +5514,49 @@ describe('readStraceChildPid', () => {
     // BUT we use a 0ms deadline so the loop exits on the first
     // Date.now() check without reading anything).
     const { readStraceChildPid } = await import('../../src/guest/agent.js');
-    const result = readStraceChildPid(process.pid, 0);
+    const result = await readStraceChildPid(process.pid, 0);
     expect(result).toBeNull();
+  });
+
+  // FLAP A regression (transient-launcher race): strace's FIRST direct child can
+  // be a short-lived launcher (e.g. yarn's node shim) that EXITS and reparents the
+  // durable install root underneath it. Resolving on the first sole-child reading
+  // pins the TRANSIENT — its pid then seeds `installRootPid`, the durable root's
+  // events never anchor, and root fs writes render `<FORGED_ROOT>` non-
+  // deterministically. The stabilization (settle N consecutive polls; reset on a
+  // 0- or >1-child window) must skip the transient and return the DURABLE root.
+  it('skips a transient launcher and returns the durable root that stabilizes', async () => {
+    const { readStraceChildPid } = await import('../../src/guest/agent.js');
+    // Scripted `/proc/<strace>/task/<strace>/children`, one entry per poll:
+    //   null              strace not forked yet            → reset
+    //   "106" "106"       transient launcher, sole child   → streak reaches 2 (< 3)
+    //   "106 108"         transient + durable both alive   → reset (>1 child)
+    //   "108" "108" "108" durable root, sole child         → streak reaches 3 → RETURN
+    const sequence: Array<string | null> = [null, '106', '106', '106 108', '108', '108', '108'];
+    let i = 0;
+    const readChildren = (): string | null => {
+      const v = sequence[Math.min(i, sequence.length - 1)] ?? null;
+      i += 1;
+      return v;
+    };
+    const result = await readStraceChildPid(0, 5000, {
+      settlePolls: 3,
+      pollIntervalMs: 0,
+      readChildren,
+    });
+    // The transient (106) only ever reached streak 2 before the >1-child reset, so
+    // it is NEVER pinned; the durable root (108) settles for 3 polls and wins.
+    expect(result).toBe(108);
+  });
+
+  it('returns the durable root when it is the sole child from the first poll', async () => {
+    const { readStraceChildPid } = await import('../../src/guest/agent.js');
+    const result = await readStraceChildPid(0, 5000, {
+      settlePolls: 3,
+      pollIntervalMs: 0,
+      readChildren: () => '108',
+    });
+    expect(result).toBe(108);
   });
 });
 

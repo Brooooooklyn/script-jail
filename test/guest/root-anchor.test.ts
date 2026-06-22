@@ -15,6 +15,7 @@ function input(over: Partial<RepoRootAnchorInput>): RepoRootAnchorInput {
     childParent: new Map(),
     execCwd: new Map(),
     cwdUnknown: () => false,
+    recycled: () => false,
     workDir: WORK,
     rootPid: 100,
     ...over,
@@ -322,5 +323,95 @@ describe('isRepoRootAnchored', () => {
     expect(
       isRepoRootAnchored(input({ pid: 42, rootPid: 42 })),
     ).toBe(true);
+  });
+
+  // --- pid-reuse determinism (the `recycled` disqualifier) -----------------
+  // A pid NUMBER reused across generations has a LAST-WINS childParent edge in
+  // the dispatcher: the surviving edge is whichever clone line drained last,
+  // which is strace -ff drain-order-dependent. A pid that ever received >=2
+  // distinct parent edges (childParentReused) or exec'd after its own exit
+  // (pidRecycled) is reported by the `recycled` predicate, and the walk must
+  // fail closed on it so the verdict is REPRODUCIBLE (a deterministic
+  // <FORGED_ROOT>) instead of flapping genuine/forged with drain order. This is
+  // the napi-rs yarn-berry husky-postinstall flap: a transient launcher whose
+  // pid lineage passes through a recycled intermediate.
+
+  it('recycled ancestor on the walk path → false, even though the chain otherwise reaches rootPid at workDir', () => {
+    // 102 -> 101 -> 100(root), every exec-cwd is workDir → WOULD anchor true,
+    // but the intermediate 101's pid number was reused (its childParent edge is
+    // not trustworthy). Fail closed.
+    const recycled = new Set([101]);
+    const over = {
+      pid: 102,
+      rootPid: 100,
+      childParent: new Map([
+        [102, 101],
+        [101, 100],
+      ]),
+      execCwd: new Map([
+        [102, WORK],
+        [101, WORK],
+      ]),
+    };
+    // Control: WITHOUT the recycle signal this exact chain anchors true. This is
+    // what makes the verdict flap when `childParent`'s last-wins edge differs by
+    // drain order; the predicate is what pins it to a deterministic false.
+    expect(isRepoRootAnchored(input({ ...over }))).toBe(true);
+    expect(
+      isRepoRootAnchored(input({ ...over, recycled: (p) => recycled.has(p) })),
+    ).toBe(false);
+  });
+
+  it('recycled leaf pid → false', () => {
+    const recycled = new Set([101]);
+    const r = isRepoRootAnchored(
+      input({
+        pid: 101,
+        rootPid: 100,
+        childParent: new Map([[101, 100]]),
+        execCwd: new Map([[101, WORK]]),
+        recycled: (p) => recycled.has(p),
+      }),
+    );
+    expect(r).toBe(false);
+  });
+
+  it('recycled rootPid number → false (defense-in-depth: a reused root pid number is not blindly trusted)', () => {
+    // Security-conservative ordering: the recycle disqualifier is checked BEFORE
+    // the rootPid success terminal, so an event whose pid === rootPid still fails
+    // closed if that pid number was observed reused. In practice the PM root pid
+    // is long-lived and never flagged, so genuine root events are unaffected; a
+    // false NEGATIVE (hiding a forged write) is the catastrophic direction, so we
+    // prefer the over-surface here.
+    const recycled = new Set([100]);
+    const r = isRepoRootAnchored(
+      input({
+        pid: 100,
+        rootPid: 100,
+        recycled: (p) => recycled.has(p),
+      }),
+    );
+    expect(r).toBe(false);
+  });
+
+  it('a clean (non-recycled) chain still anchors true with the predicate wired', () => {
+    // The predicate must NOT over-fire: a normal chain where no walked pid is
+    // recycled anchors exactly as before.
+    const r = isRepoRootAnchored(
+      input({
+        pid: 102,
+        rootPid: 100,
+        childParent: new Map([
+          [102, 101],
+          [101, 100],
+        ]),
+        execCwd: new Map([
+          [102, WORK],
+          [101, WORK],
+        ]),
+        recycled: () => false,
+      }),
+    );
+    expect(r).toBe(true);
   });
 });

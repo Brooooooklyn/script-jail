@@ -946,6 +946,36 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
   high-assurance backend**; the macOS bare backend trades some kernel-level
   cross-checks for a VM-free, CI-native macOS audit.
 
+- **The `node_startup_done` marker is forgeable content on macOS-bare.** The
+  marker rides the same same-UID-appendable JSONL channel as every other event,
+  and macOS-bare drops the `<EVENTS_FILE_FORGERY>` detector (above), so a
+  same-UID lifecycle process can append a syntactically valid marker for any pid.
+  The dispatcher therefore treats marker *contents* (ts, npm fields, any
+  provenance tag) as untrusted and uses a marker only in directions that cannot
+  manufacture a false negative from a forged line:
+  - **Env-read window is record-safe (this branch).** A marker only *ends* a
+    pid's bootstrap env window — it never opens a `raw.ts < endedTs` suppression
+    ceiling (a forged high `ts` would otherwise drop every later env read). There
+    is deliberately no trusted marker-provenance field; the worst a forged marker
+    can do is clear pending early → record *more* (the safe direction).
+  - **Two residual marker-trust paths remain, both pre-existing and accepted.**
+    (1) A marker still *confirms+drops* a non-node candidate pid's buffered
+    read/env_read events as Node bootstrap baseline — this is the load-bearing
+    suppression of the shebang pm-client's own bootstrap noise (benignly the
+    client execs `node` in the same pid and env-spy emits the marker), so making
+    it record-safe would flood every benign macOS lock; a *forged* same-pid
+    marker is the adversarial flip-side. (2) A marker's npm fields seed/supersede
+    per-pid attribution (`classifyShimNodeStartupMarker`) — macOS-bare's *only*
+    attribution source, since `MacOSProcReader` has no `/proc` environ — so a
+    forged marker can relabel a later env read (the same forgeable-attribution
+    residual as a forged exec env; supersession itself exists for recycled-pid
+    correctness). Benign installs are unaffected (the marker env-spy emits carries
+    the *same* npm fields the exec snapshot already recorded → no relabel; a
+    genuine non-node candidate emits no marker → its buffer flushes). As with the
+    other macOS-bare residuals, **Firecracker is the enforcement boundary**: the
+    strace backend's process tree + `<EVENTS_FILE_FORGERY>` detector close both
+    paths there. These are accepted no-strace fidelity gaps, not parity bugs.
+
 ## Cross-host parity testing
 
 Two separate contracts back the "byte-equal lockfile" claim, and they are

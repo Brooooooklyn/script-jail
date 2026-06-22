@@ -10355,6 +10355,8 @@ __export(agent_exports, {
   PHASE_B_STDOUT_PENDING_MAX_BYTES: () => PHASE_B_STDOUT_PENDING_MAX_BYTES,
   PHASE_B_STDOUT_TAIL_BYTES: () => PHASE_B_STDOUT_TAIL_BYTES,
   PassThrough: () => import_node_stream.PassThrough,
+  ROOT_PID_RESOLVE_DEADLINE_MS: () => ROOT_PID_RESOLVE_DEADLINE_MS,
+  ROOT_PID_RESOLVE_SETTLE_POLLS: () => ROOT_PID_RESOLVE_SETTLE_POLLS,
   StdioConnection: () => StdioConnection,
   attachStdoutTailCollector: () => attachStdoutTailCollector,
   buildChildEnv: () => buildChildEnv,
@@ -26524,7 +26526,15 @@ var MAX_DEPTH = 1024;
 function isRepoRootAnchored(input) {
   const { childParent, execCwd, workDir, rootPid } = input;
   let cur = input.pid;
+  const seen = /* @__PURE__ */ new Set();
   for (let depth = 0; depth < MAX_DEPTH; depth++) {
+    if (seen.has(cur)) {
+      return false;
+    }
+    seen.add(cur);
+    if (input.recycled(cur)) {
+      return false;
+    }
     if (cur === rootPid) {
       return true;
     }
@@ -27232,6 +27242,7 @@ async function runInstallPhase(input) {
   const deferredRelOpens = [];
   const deferredNullAttribEvents = [];
   const nodeBootstrapFileEndedTs = /* @__PURE__ */ new Map();
+  const nodeBootstrapEnvEndedTs = /* @__PURE__ */ new Map();
   function stampDeferredRelOpens(childPid, inheritedCwd, cloneFsSeed, parentAttrib, parentPid) {
     const bootstrapPendingInherited = nodeBootstrapFilePendingPids.has(childPid);
     for (const d of deferredRelOpens) {
@@ -27278,6 +27289,20 @@ async function runInstallPhase(input) {
       // Route through `cwdUnknownHas` (which maps pid -> rootedCwd) so the
       // walker's fail-closed disqualifier sees the real unknown state.
       cwdUnknown: cwdUnknownHas,
+      // Pid-reuse determinism: a pid number observed reused across generations
+      // (childParentReused = its clone edge was repointed by a different parent;
+      // pidRecycled = it exec'd after its own exit line) has a LAST-WINS
+      // `childParent` edge whose surviving parent is whichever clone line drained
+      // LAST — strace -ff drain-order-dependent. Without this veto the walk could
+      // anchor genuine in one drain order and fail closed in another (the napi-rs
+      // yarn-berry husky-postinstall `<FORGED_ROOT>` flap: the transient launcher's
+      // lineage passes through a recycled intermediate). Both sets are
+      // order-independent membership, so the veto pins the verdict to a
+      // deterministic value. The same two signals already gate
+      // `resolveDeferredAttribution` (the attribution layer); this extends them to
+      // the anchoring walk. See also the `childParentReused` veto in
+      // `lineageEverCwdShared` / `lineageSharedGroupMutated`.
+      recycled: (p) => childParentReused.has(p) || pidRecycled.has(p),
       workDir: path2.resolve(input.cwd),
       rootPid
     });
@@ -27528,6 +27553,10 @@ async function runInstallPhase(input) {
       }
       return true;
     }
+    const endedTs = nodeBootstrapEnvEndedTs.get(raw.pid);
+    if (endedTs !== void 0) {
+      return raw.ts < endedTs;
+    }
     return nodeBootstrapEnvReads.has(raw.name);
   };
   const shouldFilterPackageManagerClientEnvRead = (raw) => {
@@ -27609,6 +27638,9 @@ async function runInstallPhase(input) {
         const wasCandidate = confirmNodeBootstrapCandidate(shimEvent.pid);
         if (!wasCandidate && !nodeBootstrapFileCompletedPids.has(shimEvent.pid)) {
           nodeBootstrapFilePendingPids.add(shimEvent.pid);
+        }
+        if (!nodeBootstrapEnvEndedTs.has(shimEvent.pid)) {
+          nodeBootstrapEnvEndedTs.set(shimEvent.pid, shimEvent.ts);
         }
         clearNodeBootstrapEnv(shimEvent.pid);
         continue;
@@ -28655,7 +28687,23 @@ async function runInstallPhase(input) {
               sharedAtRead: everCwdShared.has(rawEvent.pid)
             });
           } else if ((rawEvent.kind === "read" || rawEvent.kind === "write") && rawEvent.dirfd === void 0 && path2.isAbsolute(rawEvent.path)) {
-            deferredNullAttribEvents.push({ rawEvent });
+            deferredNullAttribEvents.push({
+              rawEvent,
+              // Node-bootstrap FILE-pending verdict CAPTURED AT DEFER TIME (the
+              // read's drain moment). A reaped read is deferred here, at
+              // `result === null`, BEFORE it reaches the inline node-bootstrap
+              // filter (`shouldFilterNodeBootstrapFileRead`, ~line 7004). The
+              // defer gate and that filter run in the SAME drain iteration with
+              // NO mutation of `nodeBootstrapFilePendingPids` between them, so
+              // this snapshot equals exactly what the inline filter's pending
+              // branch would compute for the same read. Honored at the
+              // end-of-drain replay so a reaped Node-bootstrap read suppresses
+              // IDENTICALLY to the inline path — closing the reap-timing flap (a
+              // reaped root/lifecycle-runner's OWN `/usr`, `/etc/ssl`,
+              // `$REPO/package.json` bootstrap reads leaking under PREFER-EMIT).
+              // Writes are never node-bootstrap-suppressed → captured `false`.
+              bootstrapFilePendingAtDefer: rawEvent.kind === "read" && nodeBootstrapFilePendingPids.has(rawEvent.pid)
+            });
           }
           continue;
         }
@@ -28904,7 +28952,21 @@ async function runInstallPhase(input) {
       continue;
     }
     const resolved = { ...d.rawEvent, path: canonical };
-    emit({ raw: resolved, pkg: attrib.pkg, lifecycle: attrib.lifecycle });
+    if (resolved.kind === "read" && !resolved.hidden && !matcher.isProtected(resolved.path) && d.bootstrapFilePendingAtDefer === true) {
+      const fileEndedTs = nodeBootstrapFileEndedTs.get(P);
+      if (fileEndedTs === void 0 || d.rawEvent.ts < fileEndedTs) {
+        continue;
+      }
+    }
+    const attributed = {
+      raw: resolved,
+      pkg: attrib.pkg,
+      lifecycle: attrib.lifecycle
+    };
+    if (shouldBufferNodeBootstrapCandidateFileRead(attributed)) {
+      continue;
+    }
+    emit(attributed);
   }
   deferredNullAttribEvents.length = 0;
   flushAllNodeBootstrapCandidates();
@@ -29133,6 +29195,7 @@ async function runInstallPhaseMacos(input) {
   const nodeBootstrapCandidateConfirmedPids = /* @__PURE__ */ new Set();
   const nodeBootstrapCandidateFileMarkerPids = /* @__PURE__ */ new Set();
   const nodeBootstrapEnvReads = /* @__PURE__ */ new Set();
+  const nodeBootstrapEnvMarkedPids = /* @__PURE__ */ new Set();
   const nodeBootstrapFileReads = /* @__PURE__ */ new Set();
   const packageManagerClientPids = /* @__PURE__ */ new Set();
   const completedPackageManagerClientPids = /* @__PURE__ */ new Set();
@@ -29245,6 +29308,9 @@ async function runInstallPhaseMacos(input) {
       }
       return true;
     }
+    if (nodeBootstrapEnvMarkedPids.has(raw.pid)) {
+      return false;
+    }
     return nodeBootstrapEnvReads.has(raw.name);
   };
   const shouldFilterPackageManagerClientEnvRead = (raw) => {
@@ -29313,6 +29379,7 @@ async function runInstallPhaseMacos(input) {
       }
       confirmNodeBootstrapCandidate(shimEvent.pid);
       completeNodeBootstrapCandidateFileMarker(shimEvent.pid);
+      nodeBootstrapEnvMarkedPids.add(shimEvent.pid);
       clearNodeBootstrapEnv(shimEvent.pid);
       clearNodeBootstrapFile(shimEvent.pid);
       continue;
@@ -30596,34 +30663,50 @@ async function* runStraceTailer(opts) {
     }
   }
 }
-function readStraceChildPid(stracePid, deadlineMs = 50) {
+var ROOT_PID_RESOLVE_DEADLINE_MS = 5e3;
+var ROOT_PID_RESOLVE_SETTLE_POLLS = 20;
+async function readStraceChildPid(stracePid, deadlineMs = ROOT_PID_RESOLVE_DEADLINE_MS, opts = {}) {
   const start = Date.now();
-  for (let iter = 0; iter < 10; iter++) {
-    if (Date.now() - start >= deadlineMs) break;
-    let raw;
+  const POLL_INTERVAL_MS = opts.pollIntervalMs ?? 10;
+  const settlePolls = opts.settlePolls ?? ROOT_PID_RESOLVE_SETTLE_POLLS;
+  const readChildren = opts.readChildren ?? ((sp) => {
     try {
-      raw = (0, import_node_fs5.readFileSync)(
-        `/proc/${stracePid}/task/${stracePid}/children`,
+      return (0, import_node_fs5.readFileSync)(
+        `/proc/${sp}/task/${sp}/children`,
         "utf8"
       ).trim();
     } catch {
-      const sleepStart2 = Date.now();
-      while (Date.now() - sleepStart2 < 5) {
-      }
-      continue;
+      return null;
     }
-    if (raw.length === 0) {
-      const sleepStart2 = Date.now();
-      while (Date.now() - sleepStart2 < 5) {
-      }
+  });
+  let candidate = null;
+  let streak = 0;
+  for (let iter = 0; iter < 2e5; iter++) {
+    if (Date.now() - start >= deadlineMs) break;
+    const raw = readChildren(stracePid);
+    if (raw === null || raw.length === 0) {
+      candidate = null;
+      streak = 0;
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
       continue;
     }
     const pids = raw.split(/\s+/).filter((s) => s.length > 0).map((s) => parseInt(s, 10)).filter((n) => Number.isFinite(n) && n > 0);
-    if (pids.length === 1) return pids[0] ?? null;
-    if (pids.length > 1) return null;
-    const sleepStart = Date.now();
-    while (Date.now() - sleepStart < 5) {
+    if (pids.length === 1) {
+      const p = pids[0];
+      if (p === candidate) {
+        streak += 1;
+      } else {
+        candidate = p;
+        streak = 1;
+      }
+      if (streak >= settlePolls) {
+        return p;
+      }
+    } else {
+      candidate = null;
+      streak = 0;
     }
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
   }
   return null;
 }
@@ -30801,14 +30884,6 @@ var LinuxStraceRunner = class {
       this._redactStdout,
       this._stdoutTailBytes
     );
-    let rootPidDeterministicResolution = false;
-    if (child.pid !== void 0) {
-      rootPidDeterministicResolution = true;
-      const pid = readStraceChildPid(child.pid);
-      if (pid !== null) {
-        this._rootPid = pid;
-      }
-    }
     const exitStatus = {
       code: null,
       signal: null
@@ -30826,6 +30901,17 @@ var LinuxStraceRunner = class {
         resolve3();
       });
     });
+    let rootPidDeterministicResolution = false;
+    if (child.pid !== void 0) {
+      rootPidDeterministicResolution = true;
+      const pid = await readStraceChildPid(child.pid, opts.rootPidResolveDeadlineMs, {
+        ...opts.rootPidResolveSettlePolls !== void 0 ? { settlePolls: opts.rootPidResolveSettlePolls } : {},
+        ...opts.rootPidResolvePollIntervalMs !== void 0 ? { pollIntervalMs: opts.rootPidResolvePollIntervalMs } : {}
+      });
+      if (pid !== null) {
+        this._rootPid = pid;
+      }
+    }
     const watchDir = (0, import_node_path6.dirname)(opts.basePath);
     const basePrefix = (0, import_node_path6.basename)(opts.basePath);
     const fd3Stream = child.stdio[3];
@@ -31937,6 +32023,8 @@ if (isMain) {
   PHASE_B_STDOUT_PENDING_MAX_BYTES,
   PHASE_B_STDOUT_TAIL_BYTES,
   PassThrough,
+  ROOT_PID_RESOLVE_DEADLINE_MS,
+  ROOT_PID_RESOLVE_SETTLE_POLLS,
   StdioConnection,
   attachStdoutTailCollector,
   buildChildEnv,

@@ -110,6 +110,68 @@ describe('env-spy preload', () => {
     expect(fooReads[0]!.hidden).toBe(false);
   });
 
+  // REGRESSION (clock-unit): env-spy must stamp `ts` in RAW CLOCK_MONOTONIC
+  // NANOSECONDS (process.hrtime.bigint()), NOT milliseconds. The Linux guest's
+  // node-bootstrap env window compares this ts against the Rust shim's
+  // node_startup_done marker, which is clock_gettime(CLOCK_MONOTONIC) in ns. A ms
+  // ts (the old `/ 1_000_000n`) is ~1e6x smaller → numerically ALWAYS < the ns
+  // marker → every post-bootstrap JS read was wrongly SUPPRESSED (a catastrophic
+  // false negative). Bracket the read with hrtime.bigint() and assert the emitted
+  // ts lands inside that ns window; a ms ts falls ~1e6x below `before` and fails.
+  it('stamps env_read ts in CLOCK_MONOTONIC nanoseconds (not milliseconds)', async () => {
+    const logFile = freshLogFile();
+    const code = `
+      const before = process.hrtime.bigint();
+      const x = process.env.FOO;
+      const after = process.hrtime.bigint();
+      process.stdout.write(JSON.stringify({ before: before.toString(), after: after.toString() }));
+    `;
+    const result = await runWithSpy(code, {
+      SCRIPT_JAIL_LOG_FILE: logFile,
+      FOO: 'bar',
+    });
+    expect(result.exitCode).toBe(0);
+    const { before, after } = JSON.parse(result.stdout) as { before: string; after: string };
+    const beforeNs = Number(before);
+    const afterNs = Number(after);
+
+    const fooReads = readEnvReadLines(logFile).filter((l) => l.name === 'FOO');
+    expect(fooReads.length).toBeGreaterThanOrEqual(1);
+    const ts = fooReads[0]!.ts;
+    // The trap computes ts strictly between `before` and `after`; allow a tiny
+    // slack for f64 rounding of large ns values. A ms ts would be ~1e6x below
+    // beforeNs and blow straight past this.
+    const SLACK_NS = 4096;
+    expect(ts).toBeGreaterThanOrEqual(beforeNs - SLACK_NS);
+    expect(ts).toBeLessThanOrEqual(afterNs + SLACK_NS);
+  });
+
+  // REGRESSION (forge-proof clock): env-spy must stamp ts via a binding captured
+  // at preload-load time, NOT the writable public `process.hrtime.bigint` slot.
+  // Otherwise a lifecycle script could `process.hrtime.bigint = () => 0n` after
+  // the preload loads, then read an env name — the forged tiny ts would make the
+  // guest's per-pid bootstrap window treat a GENUINE post-marker read as
+  // pre-marker noise and SUPPRESS it (a false negative, the catastrophic dir).
+  it('ignores a monkeypatched process.hrtime.bigint — env_read ts cannot be forged', async () => {
+    const logFile = freshLogFile();
+    const code = `
+      // Lifecycle script forges the clock AFTER the preload already loaded.
+      process.hrtime.bigint = () => 42n;
+      const x = process.env.FOO;
+      process.stdout.write(JSON.stringify({ value: x }));
+    `;
+    const result = await runWithSpy(code, {
+      SCRIPT_JAIL_LOG_FILE: logFile,
+      FOO: 'bar',
+    });
+    expect(result.exitCode).toBe(0);
+    const fooReads = readEnvReadLines(logFile).filter((l) => l.name === 'FOO');
+    expect(fooReads.length).toBeGreaterThanOrEqual(1);
+    // NOT the forged 42, and a real CLOCK_MONOTONIC ns value (millions+).
+    expect(fooReads[0]!.ts).not.toBe(42);
+    expect(fooReads[0]!.ts).toBeGreaterThan(1_000_000);
+  });
+
   it('hides protected names: read returns undefined and is logged with hidden=true', async () => {
     const logFile = freshLogFile();
     const code = `

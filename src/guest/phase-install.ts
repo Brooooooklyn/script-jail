@@ -415,6 +415,12 @@ interface NodeStartupDoneEvent {
   kind: 'node_startup_done';
   pid: number;
   ts: number;
+  // NOTE: there is deliberately NO marker-provenance field. A `node_startup_done`
+  // line is content on the same-UID-appendable events channel, so any lifecycle
+  // process can forge one (and macOS-bare has no strace-backed events-file
+  // forgery detector). A provenance tag would therefore be attacker-controlled;
+  // the dispatchers never trust marker provenance to OPEN a suppression window —
+  // a marker only ever ENDS the bootstrap window (the record-safe direction).
 }
 
 type ShimLineEvent = RawEvent | NodeStartupDoneEvent;
@@ -456,6 +462,8 @@ export function parseShimLine(line: string): ShimLineEvent | null {
       const pid = obj['pid'];
       const ts = obj['ts'];
       if (typeof pid === 'number' && typeof ts === 'number') {
+        // Any provenance field on the line is forgeable (see NodeStartupDoneEvent)
+        // and is intentionally not read here — every marker is treated identically.
         return { kind: 'node_startup_done', pid, ts };
       }
     }
@@ -2557,6 +2565,12 @@ export async function runInstallPhase(
   //     at end-of-drain like the other deferred lists.
   interface DeferredNullAttribEvent {
     rawEvent: Extract<RawEvent, { kind: 'spawn' | 'read' | 'write' }>;
+    // Node-bootstrap FILE-pending verdict for this read, snapshotted at DEFER
+    // TIME (the read's drain moment). Mirrors what the inline filter's pending
+    // branch would compute (same drain iteration, no intervening mutation), so
+    // the replay can suppress a reaped Node-bootstrap read identically to inline
+    // — the FLAP-B fix. Always `false` for spawn/write (never bootstrap-filtered).
+    bootstrapFilePendingAtDefer?: boolean;
   }
   const deferredNullAttribEvents: DeferredNullAttribEvent[] = [];
   //   nodeBootstrapFileEndedTs: ts of a pid's OWN node-startup-done marker (the
@@ -2565,6 +2579,18 @@ export async function runInstallPhase(
   //     replay to decide whether a deferred read predates the close of the pid's
   //     inherited Node file-pending window (3rd-pass F4).
   const nodeBootstrapFileEndedTs = new Map<number, number>();
+  //   nodeBootstrapEnvEndedTs: ts of a pid's OWN node-startup-done SHIM marker
+  //     (env-spy's `node_startup_done` event), first-writer-wins. Same per-pid
+  //     shim event stream as the pid's env reads → causal ts (same clock). Used
+  //     inline to decide whether an env read predates the close of the pid's Node
+  //     env-pending window. A POST-marker env read (e.g. Node enumerating
+  //     process.env to build a child's env for a spawn) is RECORDED, not filtered
+  //     — drain-order-INDEPENDENT, the safe direction (never drop a read), and it
+  //     preserves the install:true sandbox-detection signal (a deliberate
+  //     post-bootstrap read of an injected name still surfaces). Replaces the
+  //     drain-order-RACY global `nodeBootstrapEnvReads` baseline branch for any
+  //     pid that emitted its own marker; marker-less pids keep the baseline.
+  const nodeBootstrapEnvEndedTs = new Map<number, number>();
   // Back-fill the clone-revealed facts (inherited cwd; whether the seeding clone
   // was CLONE_FS; whether the child inherited Node file-pending; the parent-
   // propagated attribution for NULL-attributed F6 entries) of every still-
@@ -2685,6 +2711,20 @@ export async function runInstallPhase(
       // Route through `cwdUnknownHas` (which maps pid -> rootedCwd) so the
       // walker's fail-closed disqualifier sees the real unknown state.
       cwdUnknown: cwdUnknownHas,
+      // Pid-reuse determinism: a pid number observed reused across generations
+      // (childParentReused = its clone edge was repointed by a different parent;
+      // pidRecycled = it exec'd after its own exit line) has a LAST-WINS
+      // `childParent` edge whose surviving parent is whichever clone line drained
+      // LAST — strace -ff drain-order-dependent. Without this veto the walk could
+      // anchor genuine in one drain order and fail closed in another (the napi-rs
+      // yarn-berry husky-postinstall `<FORGED_ROOT>` flap: the transient launcher's
+      // lineage passes through a recycled intermediate). Both sets are
+      // order-independent membership, so the veto pins the verdict to a
+      // deterministic value. The same two signals already gate
+      // `resolveDeferredAttribution` (the attribution layer); this extends them to
+      // the anchoring walk. See also the `childParentReused` veto in
+      // `lineageEverCwdShared` / `lineageSharedGroupMutated`.
+      recycled: (p) => childParentReused.has(p) || pidRecycled.has(p),
       workDir: path.resolve(input.cwd),
       rootPid,
     });
@@ -3438,6 +3478,34 @@ export async function runInstallPhase(
       }
       return true;
     }
+    // Per-pid causal marker window (mirrors the file-side `nodeBootstrapFileEndedTs`
+    // 3rd-pass F4 approach). When this pid emitted its OWN `node_startup_done`
+    // marker, an env read is Node-bootstrap noise IFF it PREDATES the marker.
+    // CLOCK CONTRACT: `raw.ts` (an env_read) and `endedTs` (the marker) are stamped
+    // by TWO producers — env-spy's JS Proxy (process.hrtime.bigint()) and the Rust
+    // shim (clock_gettime(CLOCK_MONOTONIC)) — into the same JSONL channel. BOTH read
+    // CLOCK_MONOTONIC in the SAME process (libuv's uv_hrtime IS CLOCK_MONOTONIC on
+    // Linux), so the two ts are directly comparable in NANOSECONDS regardless of
+    // which producer emitted each. (env-spy formerly emitted MILLISECONDS, which made
+    // a ms read numerically ALWAYS < the ns marker → every post-bootstrap JS read was
+    // suppressed: a false negative. env-spy now emits raw ns — see env-spy.cjs.)
+    // `raw.ts < endedTs` is therefore a causal happens-before that is
+    // drain-order-INDEPENDENT. A POST-marker read is
+    // RECORDED, not filtered: it is the genuine lifecycle pid re-reading the env
+    // envelope (e.g. Node enumerating `process.env` to build a child's env for a
+    // `spawn`, which fires the env-spy Proxy `get` for EVERY name including the
+    // injected LD_PRELOAD/PATH/SCRIPT_JAIL_*/COREPACK_*). Recording is the SAFE
+    // direction (never drop a read — the catastrophic-false-negative guard) and it
+    // preserves the install:true sandbox-detection signal (a deliberate
+    // post-bootstrap read of an injected name still surfaces). This REPLACES the
+    // drain-order-RACY global `nodeBootstrapEnvReads` baseline branch — whose
+    // membership at the read's drain moment flipped run-to-run (FLAP C). A pid with
+    // NO marker of its own (a reaped / non-Node pid we never confirmed) keeps the
+    // baseline branch unchanged (drain-order-independent set-union membership).
+    const endedTs = nodeBootstrapEnvEndedTs.get(raw.pid);
+    if (endedTs !== undefined) {
+      return raw.ts < endedTs;
+    }
     return nodeBootstrapEnvReads.has(raw.name);
   };
 
@@ -3643,6 +3711,17 @@ export async function runInstallPhase(
         const wasCandidate = confirmNodeBootstrapCandidate(shimEvent.pid);
         if (!wasCandidate && !nodeBootstrapFileCompletedPids.has(shimEvent.pid)) {
           nodeBootstrapFilePendingPids.add(shimEvent.pid);
+        }
+        // Record this pid's OWN node-bootstrap ENV window close ts (the marker's
+        // own shim-event ts — CLOCK_MONOTONIC ns, the SAME clock env-spy now stamps
+        // its env_read ts with, so the inline `raw.ts < endedTs` window test in
+        // shouldFilterNodeBootstrapEnvRead is a causal, drain-order-independent
+        // happens-before across BOTH producers; see the clock contract there).
+        // First-writer-wins,
+        // mirroring nodeBootstrapFileEndedTs: a later recycled-pid marker keeps the
+        // first generation's close ts rather than re-opening the window.
+        if (!nodeBootstrapEnvEndedTs.has(shimEvent.pid)) {
+          nodeBootstrapEnvEndedTs.set(shimEvent.pid, shimEvent.ts);
         }
         clearNodeBootstrapEnv(shimEvent.pid);
         continue;
@@ -6833,7 +6912,25 @@ export async function runInstallPhase(
             // unseeded at replay → DROPPED (the null-gate floor). Numeric-dirfd
             // opens are NOT deferred: their per-pid fd table is gone once reaped, so
             // they cannot be resolved at replay (kept on the existing drop path).
-            deferredNullAttribEvents.push({ rawEvent });
+            deferredNullAttribEvents.push({
+              rawEvent,
+              // Node-bootstrap FILE-pending verdict CAPTURED AT DEFER TIME (the
+              // read's drain moment). A reaped read is deferred here, at
+              // `result === null`, BEFORE it reaches the inline node-bootstrap
+              // filter (`shouldFilterNodeBootstrapFileRead`, ~line 7004). The
+              // defer gate and that filter run in the SAME drain iteration with
+              // NO mutation of `nodeBootstrapFilePendingPids` between them, so
+              // this snapshot equals exactly what the inline filter's pending
+              // branch would compute for the same read. Honored at the
+              // end-of-drain replay so a reaped Node-bootstrap read suppresses
+              // IDENTICALLY to the inline path — closing the reap-timing flap (a
+              // reaped root/lifecycle-runner's OWN `/usr`, `/etc/ssl`,
+              // `$REPO/package.json` bootstrap reads leaking under PREFER-EMIT).
+              // Writes are never node-bootstrap-suppressed → captured `false`.
+              bootstrapFilePendingAtDefer:
+                rawEvent.kind === 'read' &&
+                nodeBootstrapFilePendingPids.has(rawEvent.pid),
+            });
           }
           continue;
         }
@@ -7529,21 +7626,74 @@ export async function runInstallPhase(
       continue; // env-spy's own events-file append (see inline producer-write drop)
     }
     const resolved: RawEvent = { ...d.rawEvent, path: canonical };
-    // Deliberately do NOT run the node-bootstrap file filter / candidate buffering
-    // here — PREFER-EMIT (codex adversarial-review #2). Both helpers consult MUTABLE
-    // end-of-drain state (`nodeBootstrapFilePendingPids` and the GLOBAL set-union
-    // `nodeBootstrapFileReads` baseline). Consulting that final baseline for a read
-    // whose ACTUAL open happened earlier is DRAIN-ORDER-DEPENDENT: a node-bootstrap
-    // baseline that grew AFTER this read's drain position would SUPPRESS it at
-    // replay even though the inline (drain-time) path would have emitted it — a
-    // false NEGATIVE and a re-introduced cross-run flap (the exact class the
-    // relative deferredRelOpens replay avoids via read-TIME capture, 3rd-pass F4).
-    // A reaped null-/proc-attribution read is by construction a real lifecycle
-    // helper recovered from its shim exec-seed (the husky launcher), NOT Node's OWN
-    // startup bootstrap — those processes are tracked and attributed LIVE, never
-    // reach this deferred-null path. Over-recording such a read (the benign
-    // direction for a security audit) is preferable to a drain-order-dependent drop.
-    emit({ raw: resolved, pkg: attrib.pkg, lifecycle: attrib.lifecycle });
+    // Node-bootstrap FILE suppression on the reaped (null-attribution) replay.
+    // A reaped read was deferred at `result === null` BEFORE it reached the inline
+    // filter, so we reproduce ONLY the inline filter's PENDING branch (3473): a pid
+    // that is node-bootstrap-file-pending at the read suppresses its OWN startup
+    // reads. We honor the FILE-pending verdict CAPTURED AT DEFER TIME
+    // (`bootstrapFilePendingAtDefer`) — sampled in the SAME drain iteration the read
+    // drained, so it is the read-TIME verdict, equal to what the inline filter would
+    // compute there (the startup-done marker has not yet cleared the pid iff the read
+    // predates it). This closes the reap-timing flap: a reaped root/lifecycle-runner's
+    // OWN Node bootstrap reads (`/usr`, `/etc/ssl/openssl.cnf`, `$REPO/package.json`)
+    // now suppress IDENTICALLY whether or not the pid was reaped, instead of leaking
+    // via the prior PREFER-EMIT. It does NOT over-suppress the husky shim /
+    // build-worker reads (`$TMPDIR/<hash>/<bin>`): those pids are NOT file-pending at
+    // their read (`pendAtDefer=false`), so they EMIT — preserving the launcher/helper
+    // capture the deferred-null replay exists for.
+    //
+    // We deliberately do NOT reproduce the inline filter's SECOND branch (3477,
+    // `nodeBootstrapFileReads.has(path)` — suppress on baseline membership) and do
+    // NOT register this path into that baseline. codex adversarial-review #2: the
+    // reaped deferred replay runs at END OF DRAIN, where the baseline holds EVERY
+    // path any pending pid ever read across the whole trace. Suppressing a reaped
+    // read purely because some UNRELATED pid's bootstrap noise happened to touch the
+    // same path DROPS a genuine escaped read (the catastrophic false-negative
+    // direction, weighted above determinism). The per-pid read-time pending bit is
+    // the only cross-pid-collision-free signal, so it is the ONLY suppressor here; a
+    // non-pending reaped read ALWAYS emits (prefer-emit floor preserved).
+    //
+    // Writes are NEVER node-bootstrap-suppressed (the `kind === 'read'` guard): an
+    // escaped write must always surface — a dropped write is the catastrophic
+    // direction for this audit.
+    if (
+      resolved.kind === 'read' &&
+      !resolved.hidden &&
+      !matcher.isProtected(resolved.path) &&
+      d.bootstrapFilePendingAtDefer === true
+    ) {
+      // Own-marker window gate (mirrors the inline filter's PENDING semantics and
+      // the env-read window). The inline filter suppresses via PENDING only WHILE
+      // the pid is pending — the startup-done marker drain calls
+      // clearNodeBootstrapFile(pid), so a post-marker read is no longer pending and
+      // is NOT suppressed there. The deferred replay captured `pendAtDefer` at the
+      // read's drain moment, which a DELAYED clone line can re-mark `true` AFTER the
+      // pid's own bootstrap window already closed. Suppressing purely on that stale
+      // bit would DROP a genuine POST-bootstrap read (the catastrophic
+      // false-negative direction). So suppress ONLY when the read PREDATES this
+      // pid's OWN node-startup-done close ts. Both ts are the dispatcher generation
+      // counter (same clock, drain-order-independent); a pid that never emitted a
+      // marker keeps the prior pending-suppress floor (endedTs === undefined).
+      const fileEndedTs = nodeBootstrapFileEndedTs.get(P);
+      if (fileEndedTs === undefined || d.rawEvent.ts < fileEndedTs) {
+        continue;
+      }
+    }
+    const attributed: AttributedEvent = {
+      raw: resolved,
+      pkg: attrib.pkg,
+      lifecycle: attrib.lifecycle,
+    };
+    // Mirror the inline path's node-bootstrap CANDIDATE buffering (a pid whose
+    // Node identity is still unconfirmed): buffered events are resolved by
+    // `flushAllNodeBootstrapCandidates()` below (dropped-as-Node if confirmed,
+    // emitted otherwise) — identical to inline.
+    if (shouldBufferNodeBootstrapCandidateFileRead(attributed)) {
+      continue;
+    }
+    // `emit` routes a root-attributed read/write into `deferredRootEvents` for
+    // `root_anchored` stamping (the flush runs at the very end).
+    emit(attributed);
   }
   deferredNullAttribEvents.length = 0;
 

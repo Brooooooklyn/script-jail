@@ -355,6 +355,21 @@ export async function runInstallPhaseMacos(
   const nodeBootstrapCandidateConfirmedPids = new Set<number>();
   const nodeBootstrapCandidateFileMarkerPids = new Set<number>();
   const nodeBootstrapEnvReads = new Set<string>();
+  // Pids that have seen their node_startup_done marker (the end of the bootstrap
+  // env window). On macOS-bare a `node_startup_done` line is just content on the
+  // same-UID-appendable events channel — any lifecycle process can forge one, and
+  // unlike Linux there is NO strace-backed events-file forgery detector. So the
+  // marker's CONTENTS (its ts, any provenance tag) are attacker-controlled and
+  // CANNOT be used to derive a `raw.ts < endedTs` suppression ceiling: a forged
+  // high ts would suppress every genuine env read for the pid (the catastrophic
+  // false-negative). Instead a marker only ever ENDS the window — once a pid is
+  // marked, its NON-pending reads are RECORDED (the SAFE direction; the pid's
+  // bootstrap-phase reads were already suppressed while it was pending). The
+  // worst a forged marker can do is clear pending early → RECORD MORE, never
+  // suppress. This still RECORDS a genuine post-marker read whose NAME was seen
+  // during bootstrap (the global nodeBootstrapEnvReads baseline alone would
+  // wrongly drop it — the false-negative the per-pid window was added to close).
+  const nodeBootstrapEnvMarkedPids = new Set<number>();
   const nodeBootstrapFileReads = new Set<string>();
   const packageManagerClientPids = new Set<number>();
   const completedPackageManagerClientPids = new Set<number>();
@@ -487,6 +502,18 @@ export async function runInstallPhaseMacos(
       }
       return true;
     }
+    // Once this pid's node_startup_done marker has ended the window, a NON-pending
+    // read is RECORDED, never filtered. The marker's ts/provenance is forgeable
+    // content on the same-UID events channel (see nodeBootstrapEnvMarkedPids), so
+    // we MUST NOT derive a `raw.ts < endedTs` ceiling from it — recording is the
+    // SAFE direction and it preserves the install:true sandbox-detection signal (a
+    // deliberate post-bootstrap read of an injected name still surfaces). The
+    // pid's bootstrap-phase reads were already suppressed above while pending.
+    if (nodeBootstrapEnvMarkedPids.has(raw.pid)) {
+      return false;
+    }
+    // Marker-less pids (reaped / non-Node, never marked): fall back to the global
+    // bootstrap-name baseline.
     return nodeBootstrapEnvReads.has(raw.name);
   };
 
@@ -587,6 +614,13 @@ export async function runInstallPhaseMacos(
       // marker (drops buffered file reads), then clear the live windows.
       confirmNodeBootstrapCandidate(shimEvent.pid);
       completeNodeBootstrapCandidateFileMarker(shimEvent.pid);
+      // End this pid's env-read window. The marker only ENDS the window — it
+      // never opens a `raw.ts < endedTs` suppression ceiling, because the line's
+      // ts/provenance is attacker-forgeable content on the same-UID events channel
+      // and macOS-bare has no events-file forgery detector. Marking the pid means
+      // its later NON-pending reads are RECORDED (the safe direction); the worst a
+      // forged marker can do is clear pending early → record MORE, never suppress.
+      nodeBootstrapEnvMarkedPids.add(shimEvent.pid);
       clearNodeBootstrapEnv(shimEvent.pid);
       clearNodeBootstrapFile(shimEvent.pid);
       continue;

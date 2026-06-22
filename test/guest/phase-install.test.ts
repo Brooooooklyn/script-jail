@@ -5932,7 +5932,16 @@ describe('runInstallPhase', () => {
       expect(raws.some((raw) => raw['kind'] === 'read' && raw['path'] === '/work/after-marker.txt')).toBe(true);
     });
 
-    it('records Node bootstrap env reads and filters later repeats from package output', async () => {
+    // FLAP C (deterministic per-pid env-bootstrap window): an env read is filtered
+    // as Node-bootstrap noise IFF it PREDATES the pid's OWN node_startup_done marker
+    // (`raw.ts < endedTs`, same per-pid shim stream → causal, drain-order-
+    // independent). A POST-marker repeat is RECORDED, NOT filtered — it is the
+    // genuine lifecycle pid re-reading the env (e.g. Node enumerating process.env to
+    // build a child's env for a spawn). This REPLACES the old drain-order-RACY global
+    // `nodeBootstrapEnvReads` baseline branch (which suppressed later repeats by name
+    // and flapped run-to-run). Recording is the safe direction (never drop a read)
+    // and preserves the install:true sandbox-detection signal.
+    it('suppresses in-window Node bootstrap env reads but RECORDS post-marker repeats', async () => {
       const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
       const straceLines = [
         { pid: 42, line: 'execve("/usr/local/bin/node", ["node", "postinstall.js"], 0x7ffd) = 0' },
@@ -5959,13 +5968,18 @@ describe('runInstallPhase', () => {
         const parsed = JSON.parse(line) as Record<string, unknown>;
         return parsed['raw'] as Record<string, unknown>;
       });
-      expect(raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'OPENSSL_CONF')).toBe(false);
+      // OPENSSL_CONF read in-window (ts=1, < marker ts=3) is SUPPRESSED; the
+      // post-marker repeat (ts=4, >= 3) is RECORDED — so exactly one survives, the
+      // post-marker one.
+      const opensslReads = raws.filter((raw) => raw['kind'] === 'env_read' && raw['name'] === 'OPENSSL_CONF');
+      expect(opensslReads).toHaveLength(1);
+      expect(opensslReads[0]?.['ts']).toBe(4);
       expect(raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'PACKAGE_ENV')).toBe(true);
       const protectedRead = raws.find((raw) => raw['kind'] === 'env_read' && raw['name'] === 'NPM_TOKEN');
       expect(protectedRead?.['hidden']).toBe(true);
     });
 
-    it('filters bootstrap env reads for shebang-launched Node after shim confirmation', async () => {
+    it('shebang-launched Node: suppresses in-window bootstrap env reads, records post-marker repeats after shim confirmation', async () => {
       const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
       const straceLines = [
         { pid: 42, line: 'execve("/work/bin/node-tool", ["node-tool"], 0x7ffd) = 0' },
@@ -5991,7 +6005,12 @@ describe('runInstallPhase', () => {
         const parsed = JSON.parse(line) as Record<string, unknown>;
         return parsed['raw'] as Record<string, unknown>;
       });
-      expect(raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'OPENSSL_CONF')).toBe(false);
+      // Shebang entrypoint → buffered as a Node-bootstrap candidate; the marker
+      // confirms Node and drops the buffered in-window OPENSSL_CONF (ts=1). The
+      // post-marker repeat (ts=4, >= marker ts=3) is RECORDED.
+      const opensslReads = raws.filter((raw) => raw['kind'] === 'env_read' && raw['name'] === 'OPENSSL_CONF');
+      expect(opensslReads).toHaveLength(1);
+      expect(opensslReads[0]?.['ts']).toBe(4);
       expect(raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'PACKAGE_ENV')).toBe(true);
       const protectedRead = raws.find((raw) => raw['kind'] === 'env_read' && raw['name'] === 'NPM_TOKEN');
       expect(protectedRead?.['hidden']).toBe(true);
