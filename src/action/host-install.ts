@@ -1670,6 +1670,140 @@ function readPackageManagerPin(repoDir: string): { name: string; version: string
   }
 }
 
+// ---------------------------------------------------------------------------
+// Auto-enable corepack (so consumers need no manual `corepack enable` step)
+// ---------------------------------------------------------------------------
+//
+// host part-1 (hostInstallNoScripts) launches the BARE `${pm}` on PATH. For a
+// repo that pins `packageManager: "yarn@4.17.0"` (or pnpm), that bare name must
+// be a corepack SHIM — otherwise the runner's classic yarn 1.x / a standalone PM
+// runs and REJECTS the pinned-version install (and the Berry-only `--immutable
+// --mode=skip-build` flags). The architecture already ASSUMES this: part-1's
+// corepack shim WARMS the cache that part-2's resolveHostManagerLaunch resolves
+// from (see `cacheHasAnyVersion`). Consumers satisfy the assumption with a
+// `corepack enable` CI step before the action; this helper does it for them.
+//
+// SECURITY: runs PRE-TRUST, but `corepack enable` executes NO repo code — it only
+// writes PATH shims and reads NEITHER package.json NOR repo files. The one hazard
+// is launching a bare `corepack` (spawnSync resolves a bare name against PATH/CWD,
+// so a `corepack` dropped in the checkout could run pre-trust); we close it by
+// spawning the ABSOLUTE corepack bundled next to `process.execPath`. The pinned PM
+// it later downloads is the SAME code part-1 would run anyway — no new surface.
+
+export interface CorepackEnableDeps {
+  /** Override the bundled-corepack locator (tests inject an absolute fake). */
+  resolveCorepackBin?: () => string | undefined;
+  /** Override the "bare `${pm}` is already a corepack shim" probe (tests). */
+  isAlreadyEnabled?: (pm: Manager) => boolean;
+  /** Override the `packageManager` pin reader (tests). */
+  readPin?: (repoDir: string) => { name: string; version: string } | undefined;
+}
+
+/**
+ * Absolute path to the `corepack` bundled alongside the running node, or
+ * `undefined` when not present. Derived from `dirname(process.execPath)` so the
+ * result is ALWAYS outside the repo checkout and never a bare PATH/CWD lookup.
+ */
+function bundledCorepackBin(): string | undefined {
+  const names =
+    process.platform === 'win32' ? ['corepack.cmd', 'corepack.exe', 'corepack'] : ['corepack'];
+  const binDir = dirname(process.execPath);
+  for (const name of names) {
+    const cand = join(binDir, name);
+    if (existsSync(cand)) return cand;
+  }
+  return undefined;
+}
+
+/**
+ * True ONLY when bare `${pm}` resolves on PATH to a CONFIRMED corepack shim. A
+ * missing PM or any read error → `false`. NOTE the fail-direction is the OPPOSITE
+ * of {@link isCorepackShim} (which fails SAFE-to-managed for the part-2 oracle):
+ * here a false-negative merely runs an idempotent `corepack enable`, whereas a
+ * false-positive would WRONGLY skip a needed enable and break part-1.
+ */
+function isManagerCorepackShimOnPath(pm: Manager): boolean {
+  const bare = resolveBareOnPath(pm, process.env['PATH']);
+  if (bare === undefined) return false;
+  try {
+    return readFileSync(realpathSync(bare), 'utf8').includes('corepack.cjs');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Auto-enable corepack for the install:true host install, so consumers need no
+ * manual `corepack enable` step. No-op unless ALL hold: the manager is corepack-
+ * managed (yarn/pnpm — npm is node-bundled and part-2 deliberately ignores a
+ * `corepack enable npm` shim), the repo pins THIS manager via `packageManager`,
+ * and bare `${pm}` is not already a corepack shim. Best-effort: a failure is a
+ * WARNING, never fatal — part-1 surfaces any real blocker.
+ */
+export function ensureCorepackEnabled(
+  pm: Manager,
+  repoDir: string,
+  io: HostInstallIo,
+  spawn: HostSpawn = captureSpawn,
+  deps: CorepackEnableDeps = {},
+): void {
+  if (pm === 'npm') return; // node-bundled; never corepack-managed here
+
+  // Only honor an explicit `packageManager: <pm>@x` pin — that pin is the thing
+  // bare `${pm}` must resolve to. No matching pin → nothing to honor → leave the
+  // runner's PM untouched (don't silently change which yarn/pnpm runs).
+  const readPin = deps.readPin ?? readPackageManagerPin;
+  const pin = readPin(repoDir);
+  if (pin === undefined || pin.name !== pm) return;
+
+  const isAlreadyEnabled = deps.isAlreadyEnabled ?? isManagerCorepackShimOnPath;
+  if (isAlreadyEnabled(pm)) {
+    io.stdout.write(
+      `[script-jail] corepack already enabled for ${pm}; using the pinned ${pin.name}@${pin.version}\n`,
+    );
+    return;
+  }
+
+  const resolveCorepackBin = deps.resolveCorepackBin ?? bundledCorepackBin;
+  const bin = resolveCorepackBin();
+  if (bin === undefined) {
+    io.warn(
+      `script-jail: could not find the \`corepack\` bundled with node (${process.execPath}); ` +
+        `the host install needs it to honor "${pin.name}@${pin.version}". Add a ` +
+        `\`corepack enable\` step before this action if the install fails.`,
+    );
+    return;
+  }
+
+  // ABSOLUTE corepack path, cwd = node's own bin dir (outside the checkout). The
+  // env pins mirror hostInstallEnv: block a repo `.corepack.env` hijack and the
+  // interactive download prompt. `corepack enable` itself does no download.
+  let r: ReturnType<HostSpawn>;
+  try {
+    r = spawn(bin, ['enable', pm], dirname(bin), {
+      ...process.env,
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
+      COREPACK_ENV_FILE: '0',
+    });
+  } catch (err) {
+    io.warn(
+      `script-jail: \`corepack enable ${pm}\` could not be launched ` +
+        `(${err instanceof Error ? err.message : String(err)}); add a \`corepack enable\` ` +
+        `step before this action if the install fails.`,
+    );
+    return;
+  }
+  if (r.error !== undefined || (r.status !== null && r.status !== 0)) {
+    const why = r.error !== undefined ? r.error.message : `exit ${String(r.status)}`;
+    io.warn(
+      `script-jail: \`corepack enable ${pm}\` failed (${why}); add a \`corepack enable\` ` +
+        `step before this action if the install fails.`,
+    );
+    return;
+  }
+  io.stdout.write(`[script-jail] enabled corepack for ${pm} (pinned ${pin.name}@${pin.version})\n`);
+}
+
 /**
  * Resolve how host part-2 should LAUNCH the package manager, mirroring the guest's
  * direct-launch so `COREPACK_ROOT` is ABSENT on both sides (close the value-blind

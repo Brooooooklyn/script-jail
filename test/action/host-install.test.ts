@@ -5,7 +5,7 @@
 // package manager runs.
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { isAbsolute, join, delimiter } from 'node:path';
+import { isAbsolute, join, delimiter, dirname } from 'node:path';
 import {
   mkdtempSync,
   mkdirSync,
@@ -33,6 +33,8 @@ import {
   HOST_PART2_TRUNCATED_MARKER,
   HOST_PART2_DRAIN_GRACE_MS,
   resolveHostManagerLaunch,
+  ensureCorepackEnabled,
+  type CorepackEnableDeps,
   type HostSpawn,
   type HostStreamSpawn,
   type HostInstallIo,
@@ -3326,6 +3328,149 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
       if (origRepo === undefined) delete process.env['SCRIPT_JAIL_REPO_DIR'];
       else process.env['SCRIPT_JAIL_REPO_DIR'] = origRepo;
       rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('ensureCorepackEnabled (auto-enable corepack for the host install)', () => {
+  interface SpawnRec {
+    calls: Array<{ cmd: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv }>;
+    spawn: HostSpawn;
+  }
+  function recSpawn(result: ReturnType<HostSpawn> = { status: 0 }): SpawnRec {
+    const calls: SpawnRec['calls'] = [];
+    return {
+      calls,
+      spawn: (cmd, args, cwd, env) => {
+        calls.push({ cmd, args, cwd, env });
+        return result;
+      },
+    };
+  }
+  // Deps that say: repo pins yarn@4.17.0, bare yarn is NOT a shim, corepack lives
+  // at an ABSOLUTE fake path. Tests override individual fields as needed.
+  const enableDeps = (over: Partial<CorepackEnableDeps> = {}): CorepackEnableDeps => ({
+    readPin: () => ({ name: 'yarn', version: '4.17.0' }),
+    isAlreadyEnabled: () => false,
+    resolveCorepackBin: () => '/opt/hostedtoolcache/node/bin/corepack',
+    ...over,
+  });
+
+  it('npm is never corepack-enabled (node-bundled) — no spawn, no warn', () => {
+    const rec = makeRecorder();
+    const sp = recSpawn();
+    ensureCorepackEnabled('npm', '/repo', rec.io, sp.spawn, enableDeps({ readPin: () => ({ name: 'npm', version: '10.0.0' }) }));
+    expect(sp.calls).toEqual([]);
+    expect(rec.warns).toEqual([]);
+  });
+
+  it('no `packageManager` pin → no-op (does not change the runner PM)', () => {
+    const rec = makeRecorder();
+    const sp = recSpawn();
+    ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, enableDeps({ readPin: () => undefined }));
+    expect(sp.calls).toEqual([]);
+    expect(rec.warns).toEqual([]);
+  });
+
+  it('pin names a DIFFERENT manager → no-op', () => {
+    const rec = makeRecorder();
+    const sp = recSpawn();
+    ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, enableDeps({ readPin: () => ({ name: 'pnpm', version: '10.0.0' }) }));
+    expect(sp.calls).toEqual([]);
+  });
+
+  it('already a corepack shim → skip enabling (idempotent), log it', () => {
+    const rec = makeRecorder();
+    const sp = recSpawn();
+    ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, enableDeps({ isAlreadyEnabled: () => true }));
+    expect(sp.calls).toEqual([]);
+    expect(rec.out.join('')).toContain('corepack already enabled for yarn');
+  });
+
+  it('needs enabling → spawns the ABSOLUTE corepack with `enable <pm>`, env-pinned, cwd=bin dir', () => {
+    const rec = makeRecorder();
+    const sp = recSpawn();
+    ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, enableDeps());
+    expect(sp.calls).toHaveLength(1);
+    const c = sp.calls[0]!;
+    // SECURITY: an ABSOLUTE corepack path — never the bare string 'corepack'
+    // (which spawnSync would resolve against PATH/CWD → pre-trust hijack).
+    expect(c.cmd).toBe('/opt/hostedtoolcache/node/bin/corepack');
+    expect(isAbsolute(c.cmd)).toBe(true);
+    expect(c.args).toEqual(['enable', 'yarn']);
+    expect(c.cwd).toBe('/opt/hostedtoolcache/node/bin');
+    expect(c.env['COREPACK_ENABLE_DOWNLOAD_PROMPT']).toBe('0');
+    expect(c.env['COREPACK_ENV_FILE']).toBe('0');
+    expect(rec.out.join('')).toContain('enabled corepack for yarn');
+    expect(rec.warns).toEqual([]);
+  });
+
+  it('also enables pnpm', () => {
+    const rec = makeRecorder();
+    const sp = recSpawn();
+    ensureCorepackEnabled('pnpm', '/repo', rec.io, sp.spawn, enableDeps({ readPin: () => ({ name: 'pnpm', version: '10.0.0' }) }));
+    expect(sp.calls).toHaveLength(1);
+    expect(sp.calls[0]!.args).toEqual(['enable', 'pnpm']);
+  });
+
+  it('bundled corepack not found → WARN, no spawn (best-effort, not fatal)', () => {
+    const rec = makeRecorder();
+    const sp = recSpawn();
+    ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, enableDeps({ resolveCorepackBin: () => undefined }));
+    expect(sp.calls).toEqual([]);
+    expect(rec.warns.join('')).toContain('could not find the `corepack`');
+  });
+
+  it('non-zero exit → WARN, never throws', () => {
+    const rec = makeRecorder();
+    const sp = recSpawn({ status: 1 });
+    expect(() =>
+      ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, enableDeps()),
+    ).not.toThrow();
+    expect(rec.warns.join('')).toContain('`corepack enable yarn` failed');
+  });
+
+  it('spawn-level error → WARN, never throws', () => {
+    const rec = makeRecorder();
+    const sp = recSpawn({ status: null, error: new Error('ENOENT') });
+    expect(() =>
+      ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, enableDeps()),
+    ).not.toThrow();
+    expect(rec.warns.join('')).toContain('`corepack enable yarn` failed');
+  });
+
+  it('a thrown spawn is swallowed → WARN, never throws (truly best-effort)', () => {
+    const rec = makeRecorder();
+    const throwingSpawn: HostSpawn = () => {
+      throw new Error('spawn blew up');
+    };
+    expect(() =>
+      ensureCorepackEnabled('yarn', '/repo', rec.io, throwingSpawn, enableDeps()),
+    ).not.toThrow();
+    expect(rec.warns.join('')).toContain('could not be launched');
+  });
+
+  it('DEFAULT corepack locator never yields a bare name: any spawn target is absolute and under node’s bin dir', () => {
+    // Exercise the real bundledCorepackBin() (no resolveCorepackBin override).
+    // corepack may or may not sit next to the test runner's node, so accept
+    // EITHER outcome — but if it spawns, the target MUST be the absolute bundled
+    // path, never the bare string 'corepack'.
+    const rec = makeRecorder();
+    const sp = recSpawn();
+    const nodeBinDir = dirname(process.execPath);
+    ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, {
+      readPin: () => ({ name: 'yarn', version: '4.17.0' }),
+      isAlreadyEnabled: () => false,
+      // no resolveCorepackBin → use production bundledCorepackBin()
+    });
+    if (sp.calls.length > 0) {
+      const c = sp.calls[0]!;
+      expect(isAbsolute(c.cmd)).toBe(true);
+      expect(c.cmd).not.toBe('corepack');
+      expect(c.cmd.startsWith(nodeBinDir)).toBe(true);
+    } else {
+      // not bundled next to this node → must have warned, never silently no-op'd
+      expect(rec.warns.join('')).toContain('could not find the `corepack`');
     }
   });
 });

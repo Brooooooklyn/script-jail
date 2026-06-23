@@ -23,6 +23,7 @@ import { join } from 'node:path';
 
 import { parseInputs } from './action/inputs.js';
 import {
+  ensureCorepackEnabled,
   hostInstallNoScripts,
   hostRunScripts,
   trustedHostTmpdir,
@@ -73,6 +74,7 @@ export interface MainDeps {
   teardown?: typeof teardown;
   exitProcess?: (code: number) => never;
   /** Host drop-in install seams — injectable so tests need not spawn a real PM. */
+  ensureCorepackEnabled?: typeof ensureCorepackEnabled;
   hostInstallNoScripts?: typeof hostInstallNoScripts;
   hostRunScripts?: typeof hostRunScripts;
 }
@@ -99,6 +101,7 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     openVsockSession: doOpenVsockSession = openVsockSession,
     teardown: doTeardown = teardown,
     exitProcess = process.exit as (code: number) => never,
+    ensureCorepackEnabled: doEnsureCorepackEnabled = ensureCorepackEnabled,
     hostInstallNoScripts: doHostInstallNoScripts = hostInstallNoScripts,
     hostRunScripts: doHostRunScripts = hostRunScripts,
   } = deps;
@@ -487,6 +490,12 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     // residual only a script branching on TMPDIR's VALUE could see (same class as the
     // cwd/cache-path residuals; /sjtmp is a dedicated VM disk that cannot exist on host).
     const hostTmpdir = auditBackend === 'firecracker' ? trustedHostTmpdir() : undefined;
+    // Auto-enable corepack so the host install honors a `packageManager` pin
+    // (yarn/pnpm) without the consumer adding a manual `corepack enable` CI step.
+    // Best-effort + idempotent; no-op for npm, repos without a matching pin, or an
+    // already-enabled runner. Runs PRE-TRUST but executes no repo code (see
+    // ensureCorepackEnabled). MUST precede part-1, whose bare `${pm}` it fixes.
+    doEnsureCorepackEnabled(pm.manager, repoDir, { stdout: process.stdout, stderr: process.stderr, warn });
     doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn }, undefined, hostTmpdir);
     if (result.trusted) {
       // Surface the egress from the GENERATED lock runAudit just produced — it
