@@ -54,16 +54,16 @@ import type { ArtifactManifest } from './pre-fetch-artifacts.js';
  */
 export const PINNED_MANIFEST: ArtifactManifest = {
   repo: 'Brooooooklyn/script-jail', // renamed from scriptjail (old name redirects)
-  tag: 'v0.2.9',
+  tag: 'v0.2.10',
   expected: {
     linux: {
-      'rootfs-ubuntu-22.04.ext4': 'de7964344a22aa2aba2cee89611aa35885b10a9de1a2e26647f218c4c24688c5',
-      'rootfs-ubuntu-24.04.ext4': 'e3df861cd9e64d0df351e5069e57b121b04534a2cce4ab7732aced63e7762e77',
+      'rootfs-ubuntu-22.04.ext4': '8096768dace671066429267f73e4969b39ddc59bf93a2ff75ad0d6e37ee93c16',
+      'rootfs-ubuntu-24.04.ext4': '9a18c019617b3a366457f719c1b9e419649480ee6b9aaa2f102fbcbb564de184',
       'libscriptjail.so':         '00ad21620189c80228d46ecf50009350906660ee0fd68e0f695108fdccd48251',
     },
     darwin: {
-      'rootfs-ubuntu-22.04-arm64.ext4': 'f369c237f37668e2e97d8af45791e38d62515ab35e5e57fa99e55d3796da2e87',
-      'rootfs-ubuntu-24.04-arm64.ext4': '062bca58a0b867e6895096aaaf013b9eaeb696a02e7ad6fe28790d022699a51f',
+      'rootfs-ubuntu-22.04-arm64.ext4': '653d4cefa613ea89a8fa83d99139834222fb0f99a4eefeb631ad8286e9bac896',
+      'rootfs-ubuntu-24.04-arm64.ext4': '7cb92f525524528c0a222ce340910e2c87084703b436f0815aaa2b43fbc198e3',
       'libscriptjail-arm64.so':         '865379b96a5b5b79af3d2e0c5125ee71a14340fadbba34fdcc318e2f734e9911',
       // macOS-native Mach-O shim for the bare backend (DYLD_INSERT_LIBRARIES),
       // ad-hoc signed in build-mac-bin; pinned by a plain sha256 of the signed
@@ -77,8 +77,8 @@ export const PINNED_MANIFEST: ArtifactManifest = {
       // across the v0.2.0/v0.2.1/v0.2.2 producer runs.
       'coreutils-arm64':                '8e8f38d9323135a19a73d617336fce85380f3c46fcb83d3ae3e031d1c0372f21',
       'bash-arm64':                     'b067972c856c90d3147b179b4269db57bb78fc65f0e92c9b6f66efd505cec722',
-      'vmlinux-vz-x86_64':              'b6bc7254ee7e77d5849ad51464701b3a9b158aaf9124e8b7ab191f6dd875fdb5',
-      'vmlinux-vz-arm64':               'a7582e4b15f9823e39d1eaea8d5f343bfc5c21ebfc3c7ff7cf2e2e7bfafefed3',
+      'vmlinux-vz-x86_64':              'c86d64361dc3a7736bc9b2ee4b4348eb3aa1b7d7aa85198ab8cb6b6162abe100',
+      'vmlinux-vz-arm64':               '9091a10108c4f11b15866239d8a9b2c64e4fddcba0dbc5486fde4b6a4b624890',
       // No `script-jail-vm-x86_64-darwin` — see the file header for the
       // Intel-macOS-runner deprecation note.
       'script-jail-vm-arm64-darwin':    '6a14ab8d03874e189216b4bdd5d9f5ea1a5bdc7c3ed9cdb20350b818ee91c13d',
@@ -86,12 +86,12 @@ export const PINNED_MANIFEST: ArtifactManifest = {
   },
   dockerImages: {
     x64: {
-      'ubuntu-22.04': 'ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04@sha256:e877f644d653a8e5a31708f6c2c7645b4e9d51638640b084acd470cb6f02396b',
-      'ubuntu-24.04': 'ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04@sha256:75d6e70e97af4773d737e45e1f282c4e142e350cf1ee5b376765eb6ab21385f2',
+      'ubuntu-22.04': 'ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04@sha256:298ee0923b9e24e8a9f8c7f7b07b62aa2e71bdb4796644984ff06453b7d295f5',
+      'ubuntu-24.04': 'ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04@sha256:f5e39525f5bcbae9313f6a9dabda789c6d7ee4c7378d31b1ccd48bf0017a5d7c',
     },
     arm64: {
-      'ubuntu-22.04': 'ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04-arm64@sha256:002b7c216bc54e6f444eed874b3762606a60a617bd0019f07e4d16550b618fa0',
-      'ubuntu-24.04': 'ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04-arm64@sha256:37cd8c39a8e16fa90b334133cfff5b81aba75dcc02dcc4f8b55c71f567a8d84b',
+      'ubuntu-22.04': 'ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04-arm64@sha256:223fbaa8aa99154fd0fe17e476857ff01e211befd12eaeb496e2b4f600baecbe',
+      'ubuntu-24.04': 'ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04-arm64@sha256:5d1b16cd5b7c8848b0687508ec7be4497355af0e739b14343f5cb4d0843c4c56',
     },
   },
 };
