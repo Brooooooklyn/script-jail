@@ -1670,6 +1670,184 @@ function readPackageManagerPin(repoDir: string): { name: string; version: string
   }
 }
 
+// ---------------------------------------------------------------------------
+// Auto-enable corepack (so consumers need no manual `corepack enable` step)
+// ---------------------------------------------------------------------------
+//
+// host part-1 (hostInstallNoScripts) launches the BARE `${pm}` on PATH. For a
+// repo that pins `packageManager: "yarn@4.17.0"` (or pnpm), that bare name must
+// be a corepack SHIM — otherwise the runner's classic yarn 1.x / a standalone PM
+// runs and REJECTS the pinned-version install (and the Berry-only `--immutable
+// --mode=skip-build` flags). The architecture already ASSUMES this: part-1's
+// corepack shim WARMS the cache that part-2's resolveHostManagerLaunch resolves
+// from (see `cacheHasAnyVersion`). Consumers satisfy the assumption with a
+// `corepack enable` CI step before the action; this helper does it for them.
+//
+// SECURITY: runs PRE-TRUST, so it follows the same host-exec hardening every other
+// pre-trust spawn does. `corepack enable` executes NO repo code (it only writes PATH
+// shims and reads NEITHER package.json NOR repo files), but TWO inherited-state
+// vectors would otherwise bite (codex adversarial-review [critical]):
+//   1. The bundled `corepack` bin is a `#!/usr/bin/env node` shebang, so spawning IT
+//      re-resolves `node` through PATH — a checkout-prepended `bin/node` would run
+//      pre-trust regardless of corepack's own absolute path. We launch the TRUSTED
+//      `process.execPath` with corepack's JS ENTRY directly, so no PATH-based
+//      interpreter lookup ever happens.
+//   2. A raw inherited env carries NODE_OPTIONS / COREPACK_HOME / LD_PRELOAD — code/
+//      config loaders a PR can point at the checkout. We build the spawn env with
+//      stripDangerousEnv (drops them + sanitizes PATH), NOT `{...process.env}`.
+// The pinned PM part-1 later downloads is the SAME code part-1 would run anyway — no
+// new surface.
+
+export interface CorepackEnableDeps {
+  /** Override the corepack JS-entry locator (tests inject an absolute fake). */
+  resolveCorepackEntry?: () => string | undefined;
+  /** Override the "bare `${pm}` is already a corepack shim" probe (tests). */
+  isAlreadyEnabled?: (pm: Manager) => boolean;
+  /** Override the `packageManager` pin reader (tests). */
+  readPin?: (repoDir: string) => { name: string; version: string } | undefined;
+}
+
+/**
+ * Absolute path to the `corepack` BIN bundled alongside the running node, or
+ * undefined. Used ONLY as a fallback to locate corepack's JS entry — the bin is a
+ * `#!/usr/bin/env node` shebang and is NEVER spawned directly (that re-resolves
+ * `node` via PATH, a pre-trust hijack; see {@link ensureCorepackEnabled}).
+ */
+function bundledCorepackBin(): string | undefined {
+  const names =
+    process.platform === 'win32' ? ['corepack.cmd', 'corepack.exe', 'corepack'] : ['corepack'];
+  const binDir = dirname(process.execPath);
+  for (const name of names) {
+    const cand = join(binDir, name);
+    if (existsSync(cand)) return cand;
+  }
+  return undefined;
+}
+
+/**
+ * Absolute path to corepack's JS ENTRY, to be run as `node <entry>`, or undefined.
+ * Resolved from the node toolchain root (mirroring {@link resolveHostManagerLaunch}'s
+ * npm-cli.js resolution), falling back to the realpath of the bundled `corepack` bin
+ * (normally a symlink to that same dist JS). Returning the JS entry — not the bin
+ * shim — lets the caller launch the TRUSTED `process.execPath` directly and bypass
+ * the shebang's `/usr/bin/env node` PATH lookup.
+ */
+function bundledCorepackEntry(): string | undefined {
+  const toolchainRoot = dirname(dirname(process.execPath));
+  const canonical = join(toolchainRoot, 'lib', 'node_modules', 'corepack', 'dist', 'corepack.js');
+  if (existsSync(canonical)) return canonical;
+  const bin = bundledCorepackBin();
+  if (bin !== undefined) {
+    try {
+      const real = realpathSync(bin);
+      if (/\.[cm]?js$/.test(real)) return real;
+    } catch {
+      /* fall through to undefined */
+    }
+  }
+  return undefined;
+}
+
+/**
+ * True ONLY when bare `${pm}` resolves to a CONFIRMED corepack shim on the SAME
+ * sanitized PATH host part-1 uses (checkout-controlled dirs stripped via
+ * {@link sanitizePathValue}) — NOT raw `process.env.PATH`. A missing PM or any read
+ * error → `false`.
+ *
+ * Two reasons for the sanitized PATH (codex adversarial-review [medium]): (1) a PR's
+ * `$GITHUB_WORKSPACE/bin/<pm>` whose bytes merely contain `corepack.cjs` must NOT be
+ * read as an already-enabled shim — that would wrongly SKIP the enable, and part-1
+ * (which drops that checkout entry) would then resolve a DIFFERENT pm or fail; (2) the
+ * probe must agree with the exact binary part-1 will exec. NOTE the fail-direction is
+ * the OPPOSITE of {@link isCorepackShim} (which fails SAFE-to-managed for the part-2
+ * oracle): here a false-negative merely runs an idempotent `corepack enable`, whereas
+ * a false-positive would wrongly skip a needed enable and break part-1.
+ */
+function isManagerCorepackShimOnPath(pm: Manager): boolean {
+  const bare = resolveBareOnPath(pm, sanitizePathValue(process.env['PATH']));
+  if (bare === undefined) return false;
+  try {
+    return readFileSync(realpathSync(bare), 'utf8').includes('corepack.cjs');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Auto-enable corepack for the install:true host install, so consumers need no
+ * manual `corepack enable` step. No-op unless ALL hold: the manager is corepack-
+ * managed (yarn/pnpm — npm is node-bundled and part-2 deliberately ignores a
+ * `corepack enable npm` shim), the repo pins THIS manager via `packageManager`,
+ * and bare `${pm}` is not already a corepack shim. Best-effort: a failure is a
+ * WARNING, never fatal — part-1 surfaces any real blocker.
+ */
+export function ensureCorepackEnabled(
+  pm: Manager,
+  repoDir: string,
+  io: HostInstallIo,
+  spawn: HostSpawn = captureSpawn,
+  deps: CorepackEnableDeps = {},
+): void {
+  if (pm === 'npm') return; // node-bundled; never corepack-managed here
+
+  // Only honor an explicit `packageManager: <pm>@x` pin — that pin is the thing
+  // bare `${pm}` must resolve to. No matching pin → nothing to honor → leave the
+  // runner's PM untouched (don't silently change which yarn/pnpm runs).
+  const readPin = deps.readPin ?? readPackageManagerPin;
+  const pin = readPin(repoDir);
+  if (pin === undefined || pin.name !== pm) return;
+
+  const isAlreadyEnabled = deps.isAlreadyEnabled ?? isManagerCorepackShimOnPath;
+  if (isAlreadyEnabled(pm)) {
+    io.stdout.write(
+      `[script-jail] corepack already enabled for ${pm}; using the pinned ${pin.name}@${pin.version}\n`,
+    );
+    return;
+  }
+
+  const resolveCorepackEntry = deps.resolveCorepackEntry ?? bundledCorepackEntry;
+  const entry = resolveCorepackEntry();
+  if (entry === undefined) {
+    io.warn(
+      `script-jail: could not find the \`corepack\` bundled with node (${process.execPath}); ` +
+        `the host install needs it to honor "${pin.name}@${pin.version}". Add a ` +
+        `\`corepack enable\` step before this action if the install fails.`,
+    );
+    return;
+  }
+
+  // SECURITY (pre-trust spawn): launch the TRUSTED `process.execPath` with corepack's
+  // JS entry — never the `#!/usr/bin/env node` bin (which would re-resolve `node` via
+  // PATH). Build the env with stripDangerousEnv (drops NODE_OPTIONS / LD_PRELOAD /
+  // COREPACK_* / non-allowlisted YARN_*, sanitizes PATH) — NOT `{...process.env}` —
+  // then re-pin the two safe corepack flags (block a repo `.corepack.env` hijack +
+  // the interactive download prompt). cwd = node's own bin dir (outside the checkout);
+  // `corepack enable` does no download and reads no repo files.
+  const env = stripDangerousEnv(process.env);
+  env['COREPACK_ENABLE_DOWNLOAD_PROMPT'] = '0';
+  env['COREPACK_ENV_FILE'] = '0';
+  let r: ReturnType<HostSpawn>;
+  try {
+    r = spawn(process.execPath, [entry, 'enable', pm], dirname(process.execPath), env);
+  } catch (err) {
+    io.warn(
+      `script-jail: \`corepack enable ${pm}\` could not be launched ` +
+        `(${err instanceof Error ? err.message : String(err)}); add a \`corepack enable\` ` +
+        `step before this action if the install fails.`,
+    );
+    return;
+  }
+  if (r.error !== undefined || (r.status !== null && r.status !== 0)) {
+    const why = r.error !== undefined ? r.error.message : `exit ${String(r.status)}`;
+    io.warn(
+      `script-jail: \`corepack enable ${pm}\` failed (${why}); add a \`corepack enable\` ` +
+        `step before this action if the install fails.`,
+    );
+    return;
+  }
+  io.stdout.write(`[script-jail] enabled corepack for ${pm} (pinned ${pin.name}@${pin.version})\n`);
+}
+
 /**
  * Resolve how host part-2 should LAUNCH the package manager, mirroring the guest's
  * direct-launch so `COREPACK_ROOT` is ABSENT on both sides (close the value-blind
