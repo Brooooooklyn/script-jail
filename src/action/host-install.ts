@@ -1683,16 +1683,24 @@ function readPackageManagerPin(repoDir: string): { name: string; version: string
 // from (see `cacheHasAnyVersion`). Consumers satisfy the assumption with a
 // `corepack enable` CI step before the action; this helper does it for them.
 //
-// SECURITY: runs PRE-TRUST, but `corepack enable` executes NO repo code — it only
-// writes PATH shims and reads NEITHER package.json NOR repo files. The one hazard
-// is launching a bare `corepack` (spawnSync resolves a bare name against PATH/CWD,
-// so a `corepack` dropped in the checkout could run pre-trust); we close it by
-// spawning the ABSOLUTE corepack bundled next to `process.execPath`. The pinned PM
-// it later downloads is the SAME code part-1 would run anyway — no new surface.
+// SECURITY: runs PRE-TRUST, so it follows the same host-exec hardening every other
+// pre-trust spawn does. `corepack enable` executes NO repo code (it only writes PATH
+// shims and reads NEITHER package.json NOR repo files), but TWO inherited-state
+// vectors would otherwise bite (codex adversarial-review [critical]):
+//   1. The bundled `corepack` bin is a `#!/usr/bin/env node` shebang, so spawning IT
+//      re-resolves `node` through PATH — a checkout-prepended `bin/node` would run
+//      pre-trust regardless of corepack's own absolute path. We launch the TRUSTED
+//      `process.execPath` with corepack's JS ENTRY directly, so no PATH-based
+//      interpreter lookup ever happens.
+//   2. A raw inherited env carries NODE_OPTIONS / COREPACK_HOME / LD_PRELOAD — code/
+//      config loaders a PR can point at the checkout. We build the spawn env with
+//      stripDangerousEnv (drops them + sanitizes PATH), NOT `{...process.env}`.
+// The pinned PM part-1 later downloads is the SAME code part-1 would run anyway — no
+// new surface.
 
 export interface CorepackEnableDeps {
-  /** Override the bundled-corepack locator (tests inject an absolute fake). */
-  resolveCorepackBin?: () => string | undefined;
+  /** Override the corepack JS-entry locator (tests inject an absolute fake). */
+  resolveCorepackEntry?: () => string | undefined;
   /** Override the "bare `${pm}` is already a corepack shim" probe (tests). */
   isAlreadyEnabled?: (pm: Manager) => boolean;
   /** Override the `packageManager` pin reader (tests). */
@@ -1700,9 +1708,10 @@ export interface CorepackEnableDeps {
 }
 
 /**
- * Absolute path to the `corepack` bundled alongside the running node, or
- * `undefined` when not present. Derived from `dirname(process.execPath)` so the
- * result is ALWAYS outside the repo checkout and never a bare PATH/CWD lookup.
+ * Absolute path to the `corepack` BIN bundled alongside the running node, or
+ * undefined. Used ONLY as a fallback to locate corepack's JS entry — the bin is a
+ * `#!/usr/bin/env node` shebang and is NEVER spawned directly (that re-resolves
+ * `node` via PATH, a pre-trust hijack; see {@link ensureCorepackEnabled}).
  */
 function bundledCorepackBin(): string | undefined {
   const names =
@@ -1716,14 +1725,46 @@ function bundledCorepackBin(): string | undefined {
 }
 
 /**
- * True ONLY when bare `${pm}` resolves on PATH to a CONFIRMED corepack shim. A
- * missing PM or any read error → `false`. NOTE the fail-direction is the OPPOSITE
- * of {@link isCorepackShim} (which fails SAFE-to-managed for the part-2 oracle):
- * here a false-negative merely runs an idempotent `corepack enable`, whereas a
- * false-positive would WRONGLY skip a needed enable and break part-1.
+ * Absolute path to corepack's JS ENTRY, to be run as `node <entry>`, or undefined.
+ * Resolved from the node toolchain root (mirroring {@link resolveHostManagerLaunch}'s
+ * npm-cli.js resolution), falling back to the realpath of the bundled `corepack` bin
+ * (normally a symlink to that same dist JS). Returning the JS entry — not the bin
+ * shim — lets the caller launch the TRUSTED `process.execPath` directly and bypass
+ * the shebang's `/usr/bin/env node` PATH lookup.
+ */
+function bundledCorepackEntry(): string | undefined {
+  const toolchainRoot = dirname(dirname(process.execPath));
+  const canonical = join(toolchainRoot, 'lib', 'node_modules', 'corepack', 'dist', 'corepack.js');
+  if (existsSync(canonical)) return canonical;
+  const bin = bundledCorepackBin();
+  if (bin !== undefined) {
+    try {
+      const real = realpathSync(bin);
+      if (/\.[cm]?js$/.test(real)) return real;
+    } catch {
+      /* fall through to undefined */
+    }
+  }
+  return undefined;
+}
+
+/**
+ * True ONLY when bare `${pm}` resolves to a CONFIRMED corepack shim on the SAME
+ * sanitized PATH host part-1 uses (checkout-controlled dirs stripped via
+ * {@link sanitizePathValue}) — NOT raw `process.env.PATH`. A missing PM or any read
+ * error → `false`.
+ *
+ * Two reasons for the sanitized PATH (codex adversarial-review [medium]): (1) a PR's
+ * `$GITHUB_WORKSPACE/bin/<pm>` whose bytes merely contain `corepack.cjs` must NOT be
+ * read as an already-enabled shim — that would wrongly SKIP the enable, and part-1
+ * (which drops that checkout entry) would then resolve a DIFFERENT pm or fail; (2) the
+ * probe must agree with the exact binary part-1 will exec. NOTE the fail-direction is
+ * the OPPOSITE of {@link isCorepackShim} (which fails SAFE-to-managed for the part-2
+ * oracle): here a false-negative merely runs an idempotent `corepack enable`, whereas
+ * a false-positive would wrongly skip a needed enable and break part-1.
  */
 function isManagerCorepackShimOnPath(pm: Manager): boolean {
-  const bare = resolveBareOnPath(pm, process.env['PATH']);
+  const bare = resolveBareOnPath(pm, sanitizePathValue(process.env['PATH']));
   if (bare === undefined) return false;
   try {
     return readFileSync(realpathSync(bare), 'utf8').includes('corepack.cjs');
@@ -1764,9 +1805,9 @@ export function ensureCorepackEnabled(
     return;
   }
 
-  const resolveCorepackBin = deps.resolveCorepackBin ?? bundledCorepackBin;
-  const bin = resolveCorepackBin();
-  if (bin === undefined) {
+  const resolveCorepackEntry = deps.resolveCorepackEntry ?? bundledCorepackEntry;
+  const entry = resolveCorepackEntry();
+  if (entry === undefined) {
     io.warn(
       `script-jail: could not find the \`corepack\` bundled with node (${process.execPath}); ` +
         `the host install needs it to honor "${pin.name}@${pin.version}". Add a ` +
@@ -1775,16 +1816,19 @@ export function ensureCorepackEnabled(
     return;
   }
 
-  // ABSOLUTE corepack path, cwd = node's own bin dir (outside the checkout). The
-  // env pins mirror hostInstallEnv: block a repo `.corepack.env` hijack and the
-  // interactive download prompt. `corepack enable` itself does no download.
+  // SECURITY (pre-trust spawn): launch the TRUSTED `process.execPath` with corepack's
+  // JS entry — never the `#!/usr/bin/env node` bin (which would re-resolve `node` via
+  // PATH). Build the env with stripDangerousEnv (drops NODE_OPTIONS / LD_PRELOAD /
+  // COREPACK_* / non-allowlisted YARN_*, sanitizes PATH) — NOT `{...process.env}` —
+  // then re-pin the two safe corepack flags (block a repo `.corepack.env` hijack +
+  // the interactive download prompt). cwd = node's own bin dir (outside the checkout);
+  // `corepack enable` does no download and reads no repo files.
+  const env = stripDangerousEnv(process.env);
+  env['COREPACK_ENABLE_DOWNLOAD_PROMPT'] = '0';
+  env['COREPACK_ENV_FILE'] = '0';
   let r: ReturnType<HostSpawn>;
   try {
-    r = spawn(bin, ['enable', pm], dirname(bin), {
-      ...process.env,
-      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
-      COREPACK_ENV_FILE: '0',
-    });
+    r = spawn(process.execPath, [entry, 'enable', pm], dirname(process.execPath), env);
   } catch (err) {
     io.warn(
       `script-jail: \`corepack enable ${pm}\` could not be launched ` +

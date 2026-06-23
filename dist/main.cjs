@@ -27470,8 +27470,22 @@ function bundledCorepackBin() {
   }
   return void 0;
 }
+function bundledCorepackEntry() {
+  const toolchainRoot = (0, import_node_path2.dirname)((0, import_node_path2.dirname)(process.execPath));
+  const canonical = (0, import_node_path2.join)(toolchainRoot, "lib", "node_modules", "corepack", "dist", "corepack.js");
+  if ((0, import_node_fs.existsSync)(canonical)) return canonical;
+  const bin = bundledCorepackBin();
+  if (bin !== void 0) {
+    try {
+      const real = (0, import_node_fs.realpathSync)(bin);
+      if (/\.[cm]?js$/.test(real)) return real;
+    } catch {
+    }
+  }
+  return void 0;
+}
 function isManagerCorepackShimOnPath(pm) {
-  const bare = resolveBareOnPath(pm, process.env["PATH"]);
+  const bare = resolveBareOnPath(pm, sanitizePathValue(process.env["PATH"]));
   if (bare === void 0) return false;
   try {
     return (0, import_node_fs.readFileSync)((0, import_node_fs.realpathSync)(bare), "utf8").includes("corepack.cjs");
@@ -27492,21 +27506,20 @@ function ensureCorepackEnabled(pm, repoDir, io, spawn3 = captureSpawn, deps = {}
     );
     return;
   }
-  const resolveCorepackBin = deps.resolveCorepackBin ?? bundledCorepackBin;
-  const bin = resolveCorepackBin();
-  if (bin === void 0) {
+  const resolveCorepackEntry = deps.resolveCorepackEntry ?? bundledCorepackEntry;
+  const entry = resolveCorepackEntry();
+  if (entry === void 0) {
     io.warn(
       `script-jail: could not find the \`corepack\` bundled with node (${process.execPath}); the host install needs it to honor "${pin.name}@${pin.version}". Add a \`corepack enable\` step before this action if the install fails.`
     );
     return;
   }
+  const env = stripDangerousEnv(process.env);
+  env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0";
+  env["COREPACK_ENV_FILE"] = "0";
   let r;
   try {
-    r = spawn3(bin, ["enable", pm], (0, import_node_path2.dirname)(bin), {
-      ...process.env,
-      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
-      COREPACK_ENV_FILE: "0"
-    });
+    r = spawn3(process.execPath, [entry, "enable", pm], (0, import_node_path2.dirname)(process.execPath), env);
   } catch (err) {
     io.warn(
       `script-jail: \`corepack enable ${pm}\` could not be launched (${err instanceof Error ? err.message : String(err)}); add a \`corepack enable\` step before this action if the install fails.`

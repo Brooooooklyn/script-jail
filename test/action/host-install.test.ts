@@ -3347,12 +3347,13 @@ describe('ensureCorepackEnabled (auto-enable corepack for the host install)', ()
       },
     };
   }
-  // Deps that say: repo pins yarn@4.17.0, bare yarn is NOT a shim, corepack lives
-  // at an ABSOLUTE fake path. Tests override individual fields as needed.
+  const FAKE_ENTRY = '/opt/hostedtoolcache/node/lib/node_modules/corepack/dist/corepack.js';
+  // Deps that say: repo pins yarn@4.17.0, bare yarn is NOT a shim, corepack's JS
+  // entry is at an ABSOLUTE fake path. Tests override individual fields as needed.
   const enableDeps = (over: Partial<CorepackEnableDeps> = {}): CorepackEnableDeps => ({
     readPin: () => ({ name: 'yarn', version: '4.17.0' }),
     isAlreadyEnabled: () => false,
-    resolveCorepackBin: () => '/opt/hostedtoolcache/node/bin/corepack',
+    resolveCorepackEntry: () => FAKE_ENTRY,
     ...over,
   });
 
@@ -3387,18 +3388,18 @@ describe('ensureCorepackEnabled (auto-enable corepack for the host install)', ()
     expect(rec.out.join('')).toContain('corepack already enabled for yarn');
   });
 
-  it('needs enabling → spawns the ABSOLUTE corepack with `enable <pm>`, env-pinned, cwd=bin dir', () => {
+  it('needs enabling → launches the TRUSTED node with corepack entry + `enable <pm>`, hardened env', () => {
     const rec = makeRecorder();
     const sp = recSpawn();
     ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, enableDeps());
     expect(sp.calls).toHaveLength(1);
     const c = sp.calls[0]!;
-    // SECURITY: an ABSOLUTE corepack path — never the bare string 'corepack'
-    // (which spawnSync would resolve against PATH/CWD → pre-trust hijack).
-    expect(c.cmd).toBe('/opt/hostedtoolcache/node/bin/corepack');
-    expect(isAbsolute(c.cmd)).toBe(true);
-    expect(c.args).toEqual(['enable', 'yarn']);
-    expect(c.cwd).toBe('/opt/hostedtoolcache/node/bin');
+    // SECURITY [critical]: launch the TRUSTED process.execPath directly — NEVER the
+    // `#!/usr/bin/env node` corepack bin (which would re-resolve `node` via PATH).
+    expect(c.cmd).toBe(process.execPath);
+    expect(c.args).toEqual([FAKE_ENTRY, 'enable', 'yarn']);
+    expect(isAbsolute(c.args[0]!)).toBe(true);
+    expect(c.cwd).toBe(dirname(process.execPath));
     expect(c.env['COREPACK_ENABLE_DOWNLOAD_PROMPT']).toBe('0');
     expect(c.env['COREPACK_ENV_FILE']).toBe('0');
     expect(rec.out.join('')).toContain('enabled corepack for yarn');
@@ -3410,13 +3411,100 @@ describe('ensureCorepackEnabled (auto-enable corepack for the host install)', ()
     const sp = recSpawn();
     ensureCorepackEnabled('pnpm', '/repo', rec.io, sp.spawn, enableDeps({ readPin: () => ({ name: 'pnpm', version: '10.0.0' }) }));
     expect(sp.calls).toHaveLength(1);
-    expect(sp.calls[0]!.args).toEqual(['enable', 'pnpm']);
+    expect(sp.calls[0]!.args).toEqual([FAKE_ENTRY, 'enable', 'pnpm']);
   });
 
-  it('bundled corepack not found → WARN, no spawn (best-effort, not fatal)', () => {
+  // SECURITY [critical] regressions: the spawn env must be hardened, never raw
+  // process.env — NODE_OPTIONS (--require <checkout file>) and COREPACK_HOME are
+  // pre-trust code/config loaders a PR can aim at the checkout.
+  it('strips inherited NODE_OPTIONS from the corepack-enable env', () => {
+    const prev = process.env['NODE_OPTIONS'];
+    process.env['NODE_OPTIONS'] = '--require /work/checkout/evil.js';
+    try {
+      const rec = makeRecorder();
+      const sp = recSpawn();
+      ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, enableDeps());
+      expect(sp.calls).toHaveLength(1);
+      expect(sp.calls[0]!.env['NODE_OPTIONS']).toBeUndefined();
+    } finally {
+      if (prev === undefined) delete process.env['NODE_OPTIONS']; else process.env['NODE_OPTIONS'] = prev;
+    }
+  });
+
+  it('strips inherited COREPACK_HOME from the corepack-enable env', () => {
+    const prev = process.env['COREPACK_HOME'];
+    process.env['COREPACK_HOME'] = '/work/checkout/evil-corepack-home';
+    try {
+      const rec = makeRecorder();
+      const sp = recSpawn();
+      ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, enableDeps());
+      expect(sp.calls).toHaveLength(1);
+      expect(sp.calls[0]!.env['COREPACK_HOME']).toBeUndefined();
+    } finally {
+      if (prev === undefined) delete process.env['COREPACK_HOME']; else process.env['COREPACK_HOME'] = prev;
+    }
+  });
+
+  it('drops a checkout-controlled PATH entry from the corepack-enable env', () => {
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-ck-corepack-'));
+    const checkoutBin = join(repoDir, 'bin');
+    mkdirSync(checkoutBin, { recursive: true });
+    const prevPath = process.env['PATH'];
+    const prevRepo = process.env['SCRIPT_JAIL_REPO_DIR'];
+    process.env['SCRIPT_JAIL_REPO_DIR'] = repoDir; // mark repoDir as the checkout root
+    process.env['PATH'] = `${checkoutBin}${delimiter}/usr/bin`;
+    try {
+      const rec = makeRecorder();
+      const sp = recSpawn();
+      ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, enableDeps());
+      expect(sp.calls).toHaveLength(1);
+      const seenPath = (sp.calls[0]!.env['PATH'] ?? '').split(delimiter);
+      expect(seenPath).not.toContain(checkoutBin);
+      expect(seenPath).toContain('/usr/bin');
+    } finally {
+      if (prevPath === undefined) delete process.env['PATH']; else process.env['PATH'] = prevPath;
+      if (prevRepo === undefined) delete process.env['SCRIPT_JAIL_REPO_DIR']; else process.env['SCRIPT_JAIL_REPO_DIR'] = prevRepo;
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  // SECURITY [medium] regression: the DEFAULT "already enabled" probe must use the
+  // SANITIZED PATH (checkout dirs stripped), so a PR's `$CHECKOUT/bin/<pm>` whose
+  // bytes contain 'corepack.cjs' is NOT mistaken for an enabled shim → does NOT
+  // wrongly skip the needed enable.
+  it('default probe ignores a checkout-controlled fake corepack shim (no false-positive skip)', () => {
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-ck-shim-'));
+    const checkoutBin = join(repoDir, 'bin');
+    mkdirSync(checkoutBin, { recursive: true });
+    const fakePnpm = join(checkoutBin, 'pnpm');
+    writeFileSync(fakePnpm, '#!/bin/sh\n# pretends to be a corepack.cjs shim\n', { mode: 0o755 });
+    chmodSync(fakePnpm, 0o755);
+    const prevPath = process.env['PATH'];
+    const prevRepo = process.env['SCRIPT_JAIL_REPO_DIR'];
+    process.env['SCRIPT_JAIL_REPO_DIR'] = repoDir;
+    process.env['PATH'] = `${checkoutBin}${delimiter}/usr/bin`;
+    try {
+      const rec = makeRecorder();
+      const sp = recSpawn();
+      // NO isAlreadyEnabled override → exercise the real sanitized-PATH probe.
+      ensureCorepackEnabled('pnpm', '/repo', rec.io, sp.spawn, {
+        readPin: () => ({ name: 'pnpm', version: '10.0.0' }),
+        resolveCorepackEntry: () => FAKE_ENTRY,
+      });
+      // Did NOT treat the checkout shim as "already enabled": it proceeded to spawn.
+      expect(sp.calls).toHaveLength(1);
+      expect(rec.out.join('')).not.toContain('already enabled');
+    } finally {
+      if (prevPath === undefined) delete process.env['PATH']; else process.env['PATH'] = prevPath;
+      if (prevRepo === undefined) delete process.env['SCRIPT_JAIL_REPO_DIR']; else process.env['SCRIPT_JAIL_REPO_DIR'] = prevRepo;
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('corepack entry not found → WARN, no spawn (best-effort, not fatal)', () => {
     const rec = makeRecorder();
     const sp = recSpawn();
-    ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, enableDeps({ resolveCorepackBin: () => undefined }));
+    ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, enableDeps({ resolveCorepackEntry: () => undefined }));
     expect(sp.calls).toEqual([]);
     expect(rec.warns.join('')).toContain('could not find the `corepack`');
   });
@@ -3450,24 +3538,25 @@ describe('ensureCorepackEnabled (auto-enable corepack for the host install)', ()
     expect(rec.warns.join('')).toContain('could not be launched');
   });
 
-  it('DEFAULT corepack locator never yields a bare name: any spawn target is absolute and under node’s bin dir', () => {
-    // Exercise the real bundledCorepackBin() (no resolveCorepackBin override).
-    // corepack may or may not sit next to the test runner's node, so accept
-    // EITHER outcome — but if it spawns, the target MUST be the absolute bundled
-    // path, never the bare string 'corepack'.
+  it('DEFAULT resolver launches the trusted node (never a bare/shebang corepack)', () => {
+    // Exercise the real bundledCorepackEntry() (no resolveCorepackEntry override).
+    // corepack may or may not sit next to the test runner's node, so accept EITHER
+    // outcome — but if it spawns, the launcher MUST be the trusted process.execPath
+    // with an ABSOLUTE JS entry as argv[0] (never the bare string 'corepack', and
+    // never a shebang bin whose `node` would re-resolve through PATH).
     const rec = makeRecorder();
     const sp = recSpawn();
-    const nodeBinDir = dirname(process.execPath);
     ensureCorepackEnabled('yarn', '/repo', rec.io, sp.spawn, {
       readPin: () => ({ name: 'yarn', version: '4.17.0' }),
       isAlreadyEnabled: () => false,
-      // no resolveCorepackBin → use production bundledCorepackBin()
+      // no resolveCorepackEntry → use production bundledCorepackEntry()
     });
     if (sp.calls.length > 0) {
       const c = sp.calls[0]!;
-      expect(isAbsolute(c.cmd)).toBe(true);
+      expect(c.cmd).toBe(process.execPath);
       expect(c.cmd).not.toBe('corepack');
-      expect(c.cmd.startsWith(nodeBinDir)).toBe(true);
+      expect(isAbsolute(c.args[0]!)).toBe(true);
+      expect(c.args.slice(1)).toEqual(['enable', 'yarn']);
     } else {
       // not bundled next to this node → must have warned, never silently no-op'd
       expect(rec.warns.join('')).toContain('could not find the `corepack`');
