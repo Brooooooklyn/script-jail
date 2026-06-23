@@ -28231,12 +28231,35 @@ async function ensureFile(http, url2, destPath, expectedSha256) {
   await http.download(url2, destPath, expectedSha256);
   return true;
 }
+function parseOctalField(field) {
+  let i = 0;
+  const n = field.length;
+  while (i < n && field[i] === 32) i++;
+  const start = i;
+  while (i < n && field[i] >= 48 && field[i] <= 55) i++;
+  if (i === start) return null;
+  const digits = field.subarray(start, i).toString("utf8");
+  for (; i < n; i++) {
+    if (field[i] !== 0 && field[i] !== 32) return null;
+  }
+  const val = parseInt(digits, 8);
+  return Number.isFinite(val) && val >= 0 ? val : null;
+}
+function tarHeaderChecksumValid(header) {
+  const stored = parseOctalField(header.subarray(148, 156));
+  if (stored === null) return false;
+  let unsigned = 0;
+  for (let i = 0; i < 512; i++) {
+    unsigned += i >= 148 && i < 156 ? 32 : header[i];
+  }
+  return unsigned === stored;
+}
 async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch) {
   const tmpOut = (0, import_node_path6.join)(
     (0, import_node_os2.tmpdir)(),
     `script-jail-fc-${(0, import_node_crypto3.randomBytes)(4).toString("hex")}`
   );
-  const targetEntry = `firecracker-v${version2}-${releaseArch}`;
+  const targetEntry = `release-v${version2}-${releaseArch}/firecracker-v${version2}-${releaseArch}`;
   await new Promise((resolve6, reject) => {
     const gunzip = (0, import_node_zlib.createGunzip)();
     const input = (0, import_node_fs7.createReadStream)(tarPath);
@@ -28248,45 +28271,141 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
     let capturing = false;
     let outStream = null;
     let foundEntry = false;
-    const cleanup = (err) => {
-      outStream?.close();
+    let settled = false;
+    let archiveEnded = false;
+    let gunzipEnded = false;
+    let targetClosed = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      if (outStream) {
+        outStream.destroy();
+        outStream = null;
+      }
+      input.destroy();
+      gunzip.destroy();
+      void (0, import_promises2.unlink)(tmpOut).catch(() => {
+      });
+      reject(err);
+    };
+    const maybeSucceed = () => {
+      if (settled) return;
+      if (!gunzipEnded) return;
+      if (foundEntry && !targetClosed) return;
+      settled = true;
+      resolve6();
+    };
+    const openOutStream = () => {
+      const s = (0, import_node_fs7.createWriteStream)(tmpOut);
+      outStream = s;
+      s.once("error", fail);
+      s.once("close", () => {
+        targetClosed = true;
+        maybeSucceed();
+      });
+    };
+    const finalizeStream = () => {
+      if (!outStream) return;
+      const s = outStream;
       outStream = null;
-      if (err) reject(err);
-      else resolve6();
+      capturing = false;
+      s.end();
     };
     gunzip.on("data", (chunk) => {
       buf = Buffer.concat([buf, chunk]);
       processBuffer();
     });
     gunzip.on("end", () => {
-      if (outStream) outStream.close();
+      gunzipEnded = true;
       if (!foundEntry) {
-        reject(new Error(
+        fail(new Error(
           `script-jail: entry "${targetEntry}" not found in tarball ${tarPath}`
         ));
         return;
       }
-      resolve6();
+      if (state === "data" && paddedRemaining > 0 || buf.length !== 0) {
+        fail(new Error(
+          `script-jail: truncated tarball ${tarPath} (incomplete trailing data: ${paddedRemaining} block byte(s) missing, ${buf.length} stray byte(s))`
+        ));
+        return;
+      }
+      finalizeStream();
+      maybeSucceed();
     });
-    gunzip.on("error", cleanup);
-    input.on("error", cleanup);
+    gunzip.on("error", fail);
+    input.on("error", fail);
     const processBuffer = () => {
       while (buf.length >= BLOCK) {
         if (state === "header") {
           const header = buf.subarray(0, BLOCK);
           buf = buf.subarray(BLOCK);
-          if (header.every((b) => b === 0)) continue;
-          const nameRaw = header.subarray(0, 100).toString("utf8").replace(/\0.*$/u, "");
-          const name = nameRaw.includes("/") ? nameRaw.split("/").pop() : nameRaw;
-          const sizeField = header.subarray(124, 136).toString("utf8").trim().replace(/\0.*$/u, "");
-          const declaredSize = parseInt(sizeField, 8);
+          if (header.every((b) => b === 0)) {
+            archiveEnded = true;
+            continue;
+          }
+          if (archiveEnded) {
+            fail(new Error(
+              `script-jail: unexpected data after end-of-archive marker in tarball ${tarPath}`
+            ));
+            return;
+          }
+          if (!tarHeaderChecksumValid(header)) {
+            fail(new Error(
+              `script-jail: invalid tar header checksum in tarball ${tarPath}`
+            ));
+            return;
+          }
+          const typeflag = header[156];
+          if (typeflag === 120 || typeflag === 88 || typeflag === 103 || typeflag === 76 || typeflag === 75 || typeflag === 78 || typeflag === 83 || typeflag === 77) {
+            fail(new Error(
+              `script-jail: unsupported tar typeflag 0x${typeflag.toString(16)} in tarball ${tarPath}`
+            ));
+            return;
+          }
+          const magic = header.subarray(257, 263);
+          const isPosixUstar = magic[0] === 117 && magic[1] === 115 && magic[2] === 116 && magic[3] === 97 && magic[4] === 114 && magic[5] === 0;
+          const namePart = header.subarray(0, 100).toString("utf8").replace(/\0.*$/u, "");
+          const prefixPart = isPosixUstar ? header.subarray(345, 500).toString("utf8").replace(/\0.*$/u, "") : "";
+          const name = prefixPart.length > 0 ? `${prefixPart}/${namePart}` : namePart;
+          const declaredSize = parseOctalField(header.subarray(124, 136));
+          if (declaredSize === null) {
+            fail(new Error(
+              `script-jail: invalid tar header size in tarball ${tarPath}`
+            ));
+            return;
+          }
+          const bearsData = typeflag === 48 || typeflag === 0 || typeflag === 55;
+          if (!bearsData && declaredSize !== 0) {
+            fail(new Error(
+              `script-jail: non-regular tar entry (typeflag 0x${typeflag.toString(16)}) declares a non-zero size in tarball ${tarPath}`
+            ));
+            return;
+          }
           const blocks = Math.ceil(declaredSize / BLOCK);
           paddedRemaining = blocks * BLOCK;
           declaredRemaining = declaredSize;
-          if (name === targetEntry && declaredSize > 0) {
-            capturing = true;
+          if (name === targetEntry) {
+            if (foundEntry) {
+              fail(new Error(
+                `script-jail: duplicate entry "${targetEntry}" in tarball ${tarPath}`
+              ));
+              return;
+            }
             foundEntry = true;
-            outStream = (0, import_node_fs7.createWriteStream)(tmpOut);
+            if (typeflag !== 48 && typeflag !== 0) {
+              fail(new Error(
+                `script-jail: target entry "${targetEntry}" is not a regular file (typeflag 0x${typeflag.toString(16)}) in tarball ${tarPath}`
+              ));
+              return;
+            }
+            if (declaredSize === 0) {
+              fail(new Error(
+                `script-jail: target entry "${targetEntry}" is empty in tarball ${tarPath}`
+              ));
+              return;
+            }
+            capturing = true;
+            openOutStream();
           } else {
             capturing = false;
           }
@@ -28302,9 +28421,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
           paddedRemaining -= take;
           if (paddedRemaining === 0) {
             if (capturing && outStream) {
-              outStream.close();
-              outStream = null;
-              capturing = false;
+              finalizeStream();
             }
             state = "header";
           }
