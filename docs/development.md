@@ -74,8 +74,8 @@ For the build-once / download-forever single-tag release flow (run the `release-
 
 ## CI overview
 
-- `test.yml` — typecheck + unit/guest/integration/fake-e2e Vitest projects on matrix of Ubuntu 22.04/24.04 × Node 22/24/26; verifies `dist/main.cjs`, `dist/guest-agent.cjs`, and `dist/cli.cjs` are current.
-- `e2e.yml` — boots real Firecracker VMs on Ubuntu 22.04/24.04; creates `tap0`, requires `/dev/kvm`, asserts attack markers, then verifies `mode=check` fails on tampered lockfiles.
+- `test.yml` — typecheck + unit/guest/integration/fake-e2e Vitest projects on matrix of Ubuntu 22.04/24.04/26.04 × Node 22/24/26; verifies `dist/main.cjs`, `dist/guest-agent.cjs`, and `dist/cli.cjs` are current.
+- `e2e.yml` — boots real Firecracker VMs on Ubuntu 22.04/24.04/26.04 (the 26.04 host boots the 24.04 rootfs); creates `tap0`, requires `/dev/kvm`, asserts attack markers, then verifies `mode=check` fails on tampered lockfiles.
 - `parity-test.yml` — on parity-relevant PRs, runs the Action backend on `ubuntu-24.04-arm` (`backend: auto`, normally Docker on hosted arm runners) and hard-fails if the generated lockfile differs from the committed macOS/VZ arm64 baseline after parity-only filtering.
 - `test-macos.yml` — builds/tests the macOS host helper and validates the config-error smoke fixture.
 - `release.yml` — produces tagged artifacts per the manifest.

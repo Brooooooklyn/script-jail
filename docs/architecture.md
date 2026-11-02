@@ -212,7 +212,7 @@ pipeline.
 
 ## Rootfs
 
-Built per Ubuntu runner image (`ubuntu-22.04`, `ubuntu-24.04`) and arch by `src/rootfs/build.ts`. The image is minimal: no `gcc`, no `python`, no `$HOME` contents, no credentials. It bakes the standalone `vp` (vite-plus) binary; the guest's `init.sh` (Firecracker) or Docker backend bootstrap runs `vp env install <pinned version>` during Phase A to download a real Linux Node toolchain into `/opt/vp`, then `corepack enable` for `pnpm`/`yarn`. Firecracker (and the macOS VZ helper) mounts three virtio drives at boot:
+Built per Ubuntu runner image (`ubuntu-22.04`, `ubuntu-24.04`) and arch by `src/rootfs/build.ts`. An Ubuntu 26.04 host has no own image: `src/action/runner-image.ts` maps it to the `ubuntu-24.04` image, so its locks match locks made on 24.04. The image is minimal: no `gcc`, no `python`, no `$HOME` contents, no credentials. It bakes the standalone `vp` (vite-plus) binary; the guest's `init.sh` (Firecracker) or Docker backend bootstrap runs `vp env install <pinned version>` during Phase A to download a real Linux Node toolchain into `/opt/vp`, then `corepack enable` for `pnpm`/`yarn`. Firecracker (and the macOS VZ helper) mounts three virtio drives at boot:
 
 1. The rootfs itself.
 2. An ext4 overlay holding the consumer repo + package-manager caches at

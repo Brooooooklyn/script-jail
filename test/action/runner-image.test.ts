@@ -48,6 +48,16 @@ describe('detectRunnerImage — ImageOS env', () => {
     expect(r).toBe('ubuntu-24.04');
   });
 
+  it('maps ImageOS=ubuntu26 to the ubuntu-24.04 guest image', () => {
+    // No 26.04 guest image is released.  A 26.04 host reuses the 24.04
+    // rootfs / Docker image, which keeps locks made on 24.04 byte-identical.
+    const r = detectRunnerImage({
+      imageOsEnv: 'ubuntu26',
+      fs: makeFs({}),
+    });
+    expect(r).toBe('ubuntu-24.04');
+  });
+
   it('does NOT consult /etc/os-release when ImageOS is a known value', () => {
     // Even if /etc/os-release would have disagreed, ImageOS wins.
     const r = detectRunnerImage({
@@ -89,6 +99,28 @@ describe('detectRunnerImage — /etc/os-release fallback', () => {
       }),
     });
     expect(r).toBe('ubuntu-22.04');
+  });
+
+  it('maps os-release VERSION_ID=26.04 to the ubuntu-24.04 guest image', () => {
+    const r = detectRunnerImage({
+      imageOsEnv: undefined,
+      fs: makeFs({
+        '/etc/os-release': 'ID=ubuntu\nVERSION_ID="26.04"\n',
+      }),
+    });
+    expect(r).toBe('ubuntu-24.04');
+  });
+
+  it('maps a 26.04 host with an unknown ImageOS via the os-release fallback', () => {
+    // If the hosted image sets an ImageOS value we do not know, the
+    // os-release fallback must still catch 26.04.
+    const r = detectRunnerImage({
+      imageOsEnv: 'ubuntu2604',
+      fs: makeFs({
+        '/etc/os-release': 'ID=ubuntu\nVERSION_ID="26.04"\n',
+      }),
+    });
+    expect(r).toBe('ubuntu-24.04');
   });
 
   it('tolerates unquoted VERSION_ID', () => {
