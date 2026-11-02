@@ -28056,11 +28056,15 @@ var UnsupportedRunnerImageError = class extends Error {
 var OS_RELEASE_PATH = "/etc/os-release";
 var IMAGE_OS_MAP = {
   ubuntu22: "ubuntu-22.04",
-  ubuntu24: "ubuntu-24.04"
+  ubuntu24: "ubuntu-24.04",
+  // No 26.04 guest image is released; see the header comment.
+  ubuntu26: "ubuntu-24.04"
 };
 var VERSION_ID_MAP = {
   "22.04": "ubuntu-22.04",
-  "24.04": "ubuntu-24.04"
+  "24.04": "ubuntu-24.04",
+  // No 26.04 guest image is released; see the header comment.
+  "26.04": "ubuntu-24.04"
 };
 function detectRunnerImage(input) {
   const imageOsEnv = input !== void 0 && "imageOsEnv" in input ? input.imageOsEnv : process.env["ImageOS"];
@@ -28093,7 +28097,7 @@ function detectRunnerImage(input) {
     if (mapped !== void 0) return mapped;
   }
   throw new UnsupportedRunnerImageError(
-    `script-jail: unsupported runner image (ID=${id}, VERSION_ID=${versionId}). Supported: ubuntu-22.04, ubuntu-24.04.`
+    `script-jail: unsupported runner image (ID=${id}, VERSION_ID=${versionId}). Supported: ubuntu-22.04, ubuntu-24.04, ubuntu-26.04 (uses the ubuntu-24.04 guest image).`
   );
 }
 function parseOsRelease(raw) {

@@ -70,7 +70,16 @@ jobs:
       # finishes first — `fail-fast: false` keeps both legs running.
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
+        # `rootfs` is the guest image the action picks on that host (see
+        # src/action/runner-image.ts).  No 26.04 guest image is released, so
+        # the 26.04 host builds and boots the 24.04 rootfs.
+        include:
+          - os: ubuntu-22.04
+            rootfs: ubuntu-22.04
+          - os: ubuntu-24.04
+            rootfs: ubuntu-24.04
+          - os: ubuntu-26.04
+            rootfs: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -179,8 +188,8 @@ jobs:
       # three (action bundle → esbuild, shim → cargo build via
       # `src/shim/Cargo.toml`, rootfs → Docker + mkfs.ext4 via
       # scripts/build.ts → src/rootfs/build.ts).
-      - name: Build action + shim + rootfs (${{ matrix.os }})
-        run: pnpm build -- --runner-image=${{ matrix.os }}
+      - name: Build action + shim + rootfs (${{ matrix.rootfs }} on ${{ matrix.os }})
+        run: pnpm build -- --runner-image=${{ matrix.rootfs }}
 
       # `preFetchArtifacts` is skipped under SCRIPT_JAIL_E2E_SELF_TEST, so the
       # action will NOT download the rootfs / .so from a release.  Instead
@@ -193,7 +202,7 @@ jobs:
           set -euo pipefail
           IMAGES_DIR="${RUNNER_TEMP}/script-jail-images"
           mkdir -p "${IMAGES_DIR}"
-          cp images/rootfs-${{ matrix.os }}.ext4 "${IMAGES_DIR}/"
+          cp images/rootfs-${{ matrix.rootfs }}.ext4 "${IMAGES_DIR}/"
           cp images/libscriptjail.so "${IMAGES_DIR}/"
           ls -l "${IMAGES_DIR}"
 

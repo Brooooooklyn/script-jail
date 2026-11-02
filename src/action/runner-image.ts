@@ -1,28 +1,38 @@
 // script-jail — src/action/runner-image.ts
 //
 // Detects which Ubuntu runner image we are running on, so the host can pick
-// a rootfs whose glibc/library set matches the host kernel + userland.
+// which released guest artifact to use: the rootfs ext4 (Firecracker) or the
+// Docker image ref (Docker).  Bare mode passes the value through but never
+// boots the rootfs.
 //
-// Why this exists:
-//   Starting in v2, the rootfs is mounted with the host's Node binary
-//   bind-mounted in (Task #12).  That means the rootfs no longer needs to
-//   carry a Node major version — it only needs to be ABI-compatible with the
-//   host's shared libraries.  So we key the rootfs by runner image
-//   (`ubuntu-22.04`, `ubuntu-24.04`) instead of `(node-major, package-manager)`.
+// The guest does NOT share the host userland.  Firecracker boots its own
+// pinned kernel and rootfs, Docker runs the pinned image, and both install
+// the pinned Node inside the guest with `vp env install`.  So a host only
+// needs to map to SOME released guest image; the guest does not have to
+// match the host glibc.  The lockfile does not record the runner image, so
+// two hosts that map to the same guest image produce the same lock.
+//
+// Mapping (host -> guest image):
+//
+//   ubuntu 22.04 -> ubuntu-22.04
+//   ubuntu 24.04 -> ubuntu-24.04
+//   ubuntu 26.04 -> ubuntu-24.04   (no 26.04 guest image is released; reusing
+//                                   24.04 keeps locks made on 24.04 runners
+//                                   and by the CLI byte-identical)
 //
 // Resolution order:
 //
 //   1. `process.env.ImageOS` — set by GitHub-hosted runners.  Values:
 //        - `ubuntu22` → ubuntu-22.04
 //        - `ubuntu24` → ubuntu-24.04
+//        - `ubuntu26` → ubuntu-24.04
 //        - anything else → fall through to /etc/os-release
 //
 //   2. `/etc/os-release` — fallback for self-hosted runners.  We require
 //      `ID=ubuntu` and `VERSION_ID` to be one of the supported releases.
 //
-// If neither signal yields a supported image, we throw — the host can't pick
-// a rootfs blindly because a glibc mismatch would manifest as opaque dynamic
-// linker errors inside the VM.
+// Unknown releases fail closed: we throw rather than guess, so a new Ubuntu
+// release is added here on purpose after it is checked.
 //
 // The `imageOsEnv` and `fs` fields on `DetectRunnerImageInput` are injection
 // seams so tests can avoid touching real process.env or filesystem.
@@ -70,11 +80,15 @@ const OS_RELEASE_PATH = '/etc/os-release';
 const IMAGE_OS_MAP: Readonly<Record<string, RunnerImage>> = {
   ubuntu22: 'ubuntu-22.04',
   ubuntu24: 'ubuntu-24.04',
+  // No 26.04 guest image is released; see the header comment.
+  ubuntu26: 'ubuntu-24.04',
 };
 
 const VERSION_ID_MAP: Readonly<Record<string, RunnerImage>> = {
   '22.04': 'ubuntu-22.04',
   '24.04': 'ubuntu-24.04',
+  // No 26.04 guest image is released; see the header comment.
+  '26.04': 'ubuntu-24.04',
 };
 
 // ---------------------------------------------------------------------------
@@ -130,7 +144,7 @@ export function detectRunnerImage(input?: DetectRunnerImageInput): RunnerImage {
 
   throw new UnsupportedRunnerImageError(
     `script-jail: unsupported runner image (ID=${id}, VERSION_ID=${versionId}). ` +
-    'Supported: ubuntu-22.04, ubuntu-24.04.',
+    'Supported: ubuntu-22.04, ubuntu-24.04, ubuntu-26.04 (uses the ubuntu-24.04 guest image).',
   );
 }
 

@@ -31,7 +31,7 @@ jobs:
       # version regression in a single run, not chase them one at a time.
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
         node-version: ['22', '24', '26']
     steps:
       - name: Checkout
